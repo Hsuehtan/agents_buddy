@@ -3,6 +3,7 @@ import { ArrowUpRight, CircleArrowUp, X } from 'lucide-react';
 import { toast } from 'sonner';
 
 import { api } from '@/api/client';
+import { OEM_BRAND } from '@/config/oem-brand';
 import { useI18n } from '@/i18n';
 
 export const REMINDED_VERSION_KEY = 'staffdeck_update_reminded_version';
@@ -40,7 +41,7 @@ export function UpdateNotice({
       </span>
       <div className="min-w-0 flex-1">
         <p className="text-[14px] font-medium leading-[20px] text-[#18181a]">
-          {t('StaffDeck 有新版本')}
+          {OEM_BRAND.productShortName} {t('有新版本')}
         </p>
         <p className="mt-[1px] text-[12px] leading-[18px] text-[#757f9c]">
           {t('v{1} 已发布，你正在使用 v{2}', { 1: latestVersion, 2: currentVersion })}
@@ -87,7 +88,7 @@ export default function UpdateReminder({ enabled }: { enabled: boolean }) {
         <UpdateNotice
           currentVersion={result.current_version}
           latestVersion={result.latest_version!}
-          releaseUrl={result.release_url}
+          releaseUrl={OEM_BRAND.releaseUrl || result.release_url}
           onClose={() => toast.dismiss(id)}
         />
       ), {
