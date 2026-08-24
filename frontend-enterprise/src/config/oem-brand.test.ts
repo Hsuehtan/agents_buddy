@@ -6,6 +6,7 @@ import {
   applyOemBrandMetadata,
   createOemBrandConfig,
   DEFAULT_OEM_BRAND,
+  oemFilenamePrefix,
   type OemBrandConfig,
 } from './oem-brand';
 
@@ -62,6 +63,13 @@ describe('OEM brand configuration', () => {
     expect(config.logoUrl).toBe(defaults.logoUrl);
     expect(config.faviconUrl).toBe(defaults.faviconUrl);
     expect(config.supportUrl).toBe(defaults.supportUrl);
+  });
+
+  it('derives a safe visible export prefix from the configured product name', () => {
+    expect(oemFilenamePrefix({ ...DEFAULT_OEM_BRAND, productShortName: 'Acme Workspace' }))
+      .toBe('acme-workspace');
+    expect(oemFilenamePrefix({ ...DEFAULT_OEM_BRAND, productShortName: '  ' }))
+      .toBe('export');
   });
 
   it('updates browser metadata without changing page layout', () => {

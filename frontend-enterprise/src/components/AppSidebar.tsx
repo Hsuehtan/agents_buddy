@@ -209,7 +209,7 @@ function CardNavButton({
 
 function GroupLabel({ children }: { children: string }) {
   return (
-    <span className="px-[8px] pt-[6px] pb-[2px] text-[10px] leading-none text-[#464c5e] group-data-[collapsible=icon]:hidden">
+    <span className="px-[8px] pt-[6px] pb-[2px] text-[10px] leading-none text-[var(--oem-sidebar-muted-foreground)] group-data-[collapsible=icon]:hidden">
       {children}
     </span>
   );
@@ -223,7 +223,7 @@ function TeamScopeItems({
   if (scopeTeams.length === 0) return null;
   return (
     <>
-      <DropdownMenuLabel className="px-[8px] pt-[6px] pb-[2px] text-[10px] leading-none text-[#464c5e]">
+      <DropdownMenuLabel className="px-[8px] pt-[6px] pb-[2px] text-[10px] leading-none text-muted-foreground">
         团队
       </DropdownMenuLabel>
       {scopeTeams.map((team) => (
@@ -233,7 +233,7 @@ function TeamScopeItems({
           onSelect={() => onSelectAgent(toTeamScope(team.id))}
           className="shrink-0 gap-2 rounded-[14px] cursor-pointer focus:bg-[#F6F6F6] focus:[&_strong]:text-foreground! data-[active=true]:bg-[#F6F6F6] data-[active=true]:[&_strong]:text-foreground!"
         >
-          <span className="grid size-[28px] shrink-0 place-items-center rounded-[8px] border-[0.5px] border-[#e3e7f1] bg-white text-sidebar-foreground">
+          <span className="grid size-[28px] shrink-0 place-items-center rounded-[8px] border-[0.5px] border-border bg-background text-foreground">
             <IconTeams className="size-[16px]" />
           </span>
           <span className="flex min-w-0 flex-1 flex-col">
@@ -290,15 +290,15 @@ function AgentSwitcher({
           ) : (
             <div className="w-[60px] h-[30px] relative">
               <div className="absolute inset-0 flex items-end justify-center">
-                <span className="flex w-[60px] h-[71px] items-center justify-center rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white text-sidebar-foreground">
+                <span className="flex w-[60px] h-[71px] items-center justify-center rounded-[10px] border-[0.5px] border-sidebar-border bg-sidebar-accent text-sidebar-foreground">
                   {selectedTeamId ? <IconTeams className="size-[20px]" /> : <IconAdd className="size-[20px]" />}
                 </span>
               </div>
             </div>
           )}
           <span className="flex min-w-0 flex-1 flex-col gap-[4px] group-data-[collapsible=icon]:hidden">
-            <span className="text-[10px] leading-none text-[#757f9c]">{caption}</span>
-            <span className="block truncate text-[12px] font-medium leading-none text-[#464c5e]">
+            <span className="text-[10px] leading-none text-[var(--oem-sidebar-muted-foreground)]">{caption}</span>
+            <span className="block truncate text-[12px] font-medium leading-none text-sidebar-foreground">
               {nameLabel}
             </span>
           </span>
@@ -351,7 +351,7 @@ function SidebarFooterActions({ onOpenChat }: { onOpenChat: () => void }) {
         onClick={onOpenChat}
         title="对话端"
         className={cn(
-          'flex h-[40px] w-[130px] items-center justify-center gap-[6px] rounded-[10px] border-[0.5px] border-[#E3E7F1] bg-[#F6F6F6] px-[20px] py-[4px] text-[14px] text-sidebar-accent-foreground transition-opacity hover:opacity-70',
+          'flex h-[40px] w-[130px] items-center justify-center gap-[6px] rounded-[10px] border-[0.5px] border-sidebar-border bg-sidebar-accent px-[20px] py-[4px] text-[14px] text-sidebar-foreground transition-opacity hover:opacity-70',
           'group-data-[collapsible=icon]:size-[40px] group-data-[collapsible=icon]:w-[40px] group-data-[collapsible=icon]:px-0',
         )}
       >
@@ -373,7 +373,7 @@ function SidebarFooterActions({ onOpenChat }: { onOpenChat: () => void }) {
 
 function CollapsedGroupLabel({ children }: { children: string }) {
   return (
-    <span className="text-[10px] leading-none text-[#464c5e]">
+    <span className="text-[10px] leading-none text-[var(--oem-sidebar-muted-foreground)]">
       {children}
     </span>
   );
@@ -401,6 +401,7 @@ function CollapsedNavButton({
         <button
           type="button"
           aria-label={item.label}
+          aria-current={active ? 'page' : undefined}
           onClick={() => onNavigate(item.route)}
           className={cn(
             'relative flex size-[32px] shrink-0 items-center justify-center text-sidebar-foreground transition-colors',
@@ -447,11 +448,11 @@ function CollapsedAgentSwitcher({
           {currentAgent ? (
             <EmployeeAvatar agent={currentAgent} width={32} height={38} radius={8} />
           ) : (
-            <span className="flex h-[38px] w-[32px] items-center justify-center rounded-[8px] border-[0.5px] border-[#e3e7f1] bg-white text-sidebar-foreground">
+            <span className="flex h-[38px] w-[32px] items-center justify-center rounded-[8px] border-[0.5px] border-sidebar-border bg-sidebar-accent text-sidebar-foreground">
               {selectedTeamId ? <IconTeams className="size-[16px]" /> : <IconAdd className="size-[16px]" />}
             </span>
           )}
-          <span className="w-[34px] text-center text-[10px] font-medium leading-tight wrap-break-word text-[#18181a]">
+          <span className="w-[34px] text-center text-[10px] font-medium leading-tight wrap-break-word text-sidebar-foreground">
             {nameLabel}
           </span>
         </button>
@@ -553,7 +554,7 @@ function CollapsedSidebar({
       </div>
 
       <div className="flex min-h-0 w-full flex-1 flex-col items-center justify-between">
-        <div className="flex w-[38px] flex-col items-center gap-[8px] rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-white px-[2px] pt-[6px] pb-[8px]">
+        <div className="flex w-[38px] flex-col items-center gap-[8px] rounded-[10px] border-[0.5px] border-sidebar-border bg-sidebar px-[2px] pt-[6px] pb-[8px]">
           <CollapsedAgentSwitcher
             sidebarAgent={sidebarAgent}
             scopeAgents={scopeAgents}
@@ -599,7 +600,7 @@ function CollapsedSidebar({
                 type="button"
                 onClick={onOpenChat}
                 aria-label="切换到对话端"
-                className="flex size-[32px] shrink-0 items-center justify-center rounded-[10px] border-[0.5px] border-[#E3E7F1] bg-[#F6F6F6] text-sidebar-accent-foreground transition-opacity hover:opacity-70"
+                className="flex size-[32px] shrink-0 items-center justify-center rounded-[10px] border-[0.5px] border-sidebar-border bg-sidebar-accent text-sidebar-foreground transition-opacity hover:opacity-70"
               >
                 <IconChat className="size-[16px]!" />
               </button>
@@ -683,14 +684,13 @@ function ManagementSidebar({
               />
             ))}
           </SidebarMenu>
-          <div className="h-px w-full bg-sidebar-border group-data-[collapsible=icon]:hidden" />
         </div>
       </SidebarHeader>
 
       <SidebarContent className="px-[20px] group-data-[collapsible=icon]:px-[20px]">
         <div
           className={cn(
-            'mt-[36px] mb-[24px] flex flex-col gap-[8px] rounded-[20px] border-[0.5px] border-[#e3e7f1] bg-sidebar px-[4px] pt-[6px] pb-[8px]',
+            'mt-[36px] mb-[24px] flex flex-col gap-[8px] rounded-[20px] border-[0.5px] border-sidebar-border bg-sidebar px-[4px] pt-[6px] pb-[8px]',
             'group-data-[collapsible=icon]:mt-[24px] group-data-[collapsible=icon]:border-transparent group-data-[collapsible=icon]:bg-transparent group-data-[collapsible=icon]:p-0 group-data-[collapsible=icon]:shadow-none',
           )}
         >
@@ -764,7 +764,7 @@ function TeamGroupAvatar({
 
   return (
     <span
-      className="grid shrink-0 grid-cols-2 place-content-center gap-[2px] overflow-hidden rounded-[12px] border-[0.5px] border-[#dfe3ea] bg-[#eef0f4] p-[3px]"
+      className="grid shrink-0 grid-cols-2 place-content-center gap-[2px] overflow-hidden rounded-[12px] border-[0.5px] border-sidebar-border bg-sidebar-accent p-[3px]"
       style={{ width: size, height: size }}
     >
       {members.length > 0 ? members.map((member) => (
@@ -775,7 +775,7 @@ function TeamGroupAvatar({
           radius={radius}
         />
       )) : (
-        <IconTeams className="col-span-2 m-auto size-[18px]! text-[#646b7c]" />
+        <IconTeams className="col-span-2 m-auto size-[18px]! text-sidebar-foreground" />
       )}
     </span>
   );
@@ -801,25 +801,25 @@ function ChatSessionFilter({
           <button
             type="button"
             aria-label="筛选会话"
-            className="flex h-[32px] w-full items-center justify-center rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-[#f6f6f6] transition-colors hover:border-[#c9d2e4]"
+            className="flex h-[32px] w-full items-center justify-center rounded-[10px] border-[0.5px] border-sidebar-border bg-sidebar-accent text-sidebar-foreground transition-colors hover:border-sidebar-ring"
           >
-            <IconSort className="size-[14px]! shrink-0 text-[#858b9c]" />
+            <IconSort className="size-[14px]! shrink-0 text-[var(--oem-sidebar-muted-foreground)]" />
           </button>
         ) : (
           <button
             type="button"
             aria-label="筛选会话"
-            className="flex h-[40px] w-full items-center justify-between rounded-[14px] border-[0.5px] border-[#e3e7f1] bg-[#f6f6f6] px-[20px] py-[10px] text-left transition-colors hover:border-[#c9d2e4]"
+            className="flex h-[40px] w-full items-center justify-between rounded-[14px] border-[0.5px] border-sidebar-border bg-sidebar-accent px-[20px] py-[10px] text-left transition-colors hover:border-sidebar-ring"
           >
             <span className="flex min-w-0 items-center gap-[6px]">
-              <span className="truncate text-[14px] text-[#464c5e]">{namePart}</span>
+              <span className="truncate text-[14px] text-sidebar-foreground">{namePart}</span>
               {countPart && (
-                <span className="inline-flex h-[18px] min-w-[30px] items-center justify-center rounded-full bg-white px-[4px] text-[12px] text-[#757f9c]">
+                <span className="inline-flex h-[18px] min-w-[30px] items-center justify-center rounded-full bg-sidebar px-[4px] text-[12px] text-[var(--oem-sidebar-muted-foreground)]">
                   {countPart}
                 </span>
               )}
             </span>
-            <IconSort className="size-[14px]! shrink-0 text-[#858b9c]" />
+            <IconSort className="size-[14px]! shrink-0 text-[var(--oem-sidebar-muted-foreground)]" />
           </button>
         )}
       </DropdownMenuTrigger>
@@ -915,7 +915,7 @@ function ChatHandoffButton({
     <button
       type="button"
       onClick={onOpen}
-      className="flex items-center justify-between gap-[12px] rounded-[8px] px-[20px] py-[10px] text-left text-[14px] text-[#858b9c] transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+      className="flex items-center justify-between gap-[12px] rounded-[8px] px-[20px] py-[10px] text-left text-[14px] text-[var(--oem-sidebar-muted-foreground)] transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
     >
       <span className="flex min-w-0 items-center gap-[12px]">
         <IconChatBubble className="size-[16px]! shrink-0" />
@@ -975,8 +975,8 @@ function ChatSessionRow({
       className={cn(
         'group/session relative flex w-full cursor-pointer items-center gap-[6px] rounded-[14px] py-[6px] pl-[8px] pr-[12px] text-left transition-colors',
         active
-          ? 'border-[0.5px] border-[#e3e7f1] bg-white shadow-[0px_0px_5px_rgba(0,0,0,0.05)]'
-          : 'border-[0.5px] border-transparent hover:bg-[#f4f5f7]',
+          ? 'border-[0.5px] border-sidebar-border bg-sidebar-accent shadow-[0px_0px_5px_rgba(0,0,0,0.05)]'
+          : 'border-[0.5px] border-transparent hover:bg-sidebar-accent',
       )}
     >
       <Tooltip>
@@ -984,7 +984,7 @@ function ChatSessionRow({
           {isTeamGroup ? (
             <TeamGroupAvatar team={team} agents={agents} />
           ) : (
-            <span className="inline-grid size-[42px] shrink-0 place-items-center overflow-hidden rounded-[12px] bg-[#f1f2f5] text-[#464c5e]">
+            <span className="inline-grid size-[42px] shrink-0 place-items-center overflow-hidden rounded-[12px] bg-sidebar-accent text-sidebar-foreground">
               {agent ? (
               <EmployeeAvatar agent={agent} size={42} radius={12} />
               ) : (
@@ -1001,7 +1001,7 @@ function ChatSessionRow({
       </Tooltip>
       <span className="flex min-w-0 flex-1 flex-col justify-between self-stretch py-[3px]">
         <span className="flex min-w-0 items-center gap-[4px]">
-          <span className="truncate text-[14px] leading-none text-[#464c5e] capitalize" title={displayTitle}>
+          <span className="truncate text-[14px] leading-none text-sidebar-foreground capitalize" title={displayTitle}>
             {displayTitle}
           </span>
           {isTeamGroup && (
@@ -1013,7 +1013,7 @@ function ChatSessionRow({
             </span>
           )}
         </span>
-        <span className="truncate text-[12px] leading-none text-[#757f9c]" title={displaySubtitle}>
+        <span className="truncate text-[12px] leading-none text-[var(--oem-sidebar-muted-foreground)]" title={displaySubtitle}>
           {displaySubtitle}
         </span>
       </span>
@@ -1028,7 +1028,7 @@ function ChatSessionRow({
             event.stopPropagation();
             onRenameSession(session);
           }}
-          className="inline-grid size-[24px] place-items-center rounded-[10px] text-[#858b9c] transition-colors hover:bg-[#e3e7f1] hover:text-[#18181a]"
+          className="inline-grid size-[24px] place-items-center rounded-[10px] text-[var(--oem-sidebar-muted-foreground)] transition-colors hover:bg-sidebar hover:text-sidebar-foreground"
         >
           <IconEdit className="size-[14px]!" />
         </button>
@@ -1051,10 +1051,10 @@ function ChatSessionRow({
 function ChatSessionRowSkeleton() {
   return (
     <div className="flex w-full animate-pulse items-center gap-[6px] rounded-[14px] border-[0.5px] border-transparent px-[8px] py-[6px]">
-      <span className="size-[42px] shrink-0 rounded-[12px] bg-[#eef0f4]" />
+      <span className="size-[42px] shrink-0 rounded-[12px] bg-sidebar-accent" />
       <span className="flex min-w-0 flex-1 flex-col gap-[6px] pb-[2px]">
-        <span className="h-[12px] w-[60%] rounded-full bg-[#eef0f4]" />
-        <span className="h-[10px] w-[40%] rounded-full bg-[#f1f2f5]" />
+        <span className="h-[12px] w-[60%] rounded-full bg-sidebar-accent" />
+        <span className="h-[10px] w-[40%] rounded-full bg-sidebar-accent" />
       </span>
     </div>
   );
@@ -1077,7 +1077,7 @@ function ChatFooterActions({ onOpenAdmin }: { onOpenAdmin: () => void }) {
         type="button"
         onClick={onOpenAdmin}
         title="管理端"
-        className="flex h-[40px] w-[130px] items-center justify-center gap-[6px] rounded-[10px] border-[0.5px] border-[#E3E7F1] bg-[#F6F6F6] px-[20px] py-[4px] text-[14px] text-[#858b9c] transition-opacity hover:opacity-70"
+        className="flex h-[40px] w-[130px] items-center justify-center gap-[6px] rounded-[10px] border-[0.5px] border-sidebar-border bg-sidebar-accent px-[20px] py-[4px] text-[14px] text-sidebar-foreground transition-opacity hover:opacity-70"
       >
         <IconViewMasonry className="size-[16px]!" />
         <span>管理端</span>
@@ -1181,7 +1181,7 @@ function CollapsedChatSidebar({
                 type="button"
                 onClick={onNewConversation}
                 aria-label="新建对话"
-                className="flex h-[32px] w-full items-center justify-center rounded-[8px] bg-[#18181a] text-white transition-colors hover:bg-[#303030]"
+                className="flex h-[32px] w-full items-center justify-center rounded-[8px] bg-[var(--oem-sidebar-active-background)] text-[var(--oem-sidebar-active-foreground)] transition-opacity hover:opacity-90"
               >
                 <IconAdd className="size-[16px]!" />
               </button>
@@ -1192,12 +1192,12 @@ function CollapsedChatSidebar({
           </Tooltip>
         )}
 
-        <span className="text-[10px] leading-none text-[#464c5e]">会话</span>
+        <span className="text-[10px] leading-none text-[var(--oem-sidebar-muted-foreground)]">会话</span>
 
         <div className="no-scrollbar mx-[-8px] flex min-h-0 w-[calc(100%+16px)] flex-1 flex-col items-center gap-[10px] overflow-y-auto py-[2px]">
           {sessionsLoading
             ? Array.from({ length: 5 }).map((_, index) => (
-                <span key={index} className="size-[36px] shrink-0 animate-pulse rounded-[10px] bg-[#eef0f4]" />
+                <span key={index} className="size-[36px] shrink-0 animate-pulse rounded-[10px] bg-sidebar-accent" />
               ))
             : sessions.map((session) => {
                 const agent = sessionAgentFor(session, agents);
@@ -1217,8 +1217,8 @@ function CollapsedChatSidebar({
                         className={cn(
                           'relative flex shrink-0 items-center justify-center overflow-hidden transition-shadow',
                           active
-                            ? 'size-[44px] rounded-[14px] border-[0.5px] border-[#464c5e] bg-white shadow-[0px_0px_5px_rgba(0,0,0,0.1)]'
-                            : 'size-[36px] rounded-[10px] bg-[#D8D8D8] text-[#464c5e]',
+                            ? 'size-[44px] rounded-[14px] border-[0.5px] border-sidebar-ring bg-sidebar-accent shadow-[0px_0px_5px_rgba(0,0,0,0.1)]'
+                            : 'size-[36px] rounded-[10px] bg-sidebar-accent text-sidebar-foreground',
                         )}
                       >
                         {session.team_id ? (
@@ -1251,7 +1251,7 @@ function CollapsedChatSidebar({
               type="button"
               onClick={onOpenAdmin}
               aria-label="切换到管理端"
-              className="flex size-[32px] shrink-0 items-center justify-center rounded-[10px] border-[0.5px] border-[#E3E7F1] bg-[#F6F6F6] text-[#858b9c] transition-opacity hover:opacity-70"
+              className="flex size-[32px] shrink-0 items-center justify-center rounded-[10px] border-[0.5px] border-sidebar-border bg-sidebar-accent text-sidebar-foreground transition-opacity hover:opacity-70"
             >
               <IconViewMasonry className="size-[16px]!" />
             </button>
@@ -1344,7 +1344,7 @@ function ChatSidebarVariant({
                 'flex items-center gap-[12px] rounded-[8px] px-[20px] py-[10px] text-left text-[14px] transition-colors',
                 galleryActive
                   ? 'bg-sidebar-accent text-sidebar-accent-foreground'
-                  : 'text-[#858b9c] hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
+                  : 'text-[var(--oem-sidebar-muted-foreground)] hover:bg-sidebar-accent hover:text-sidebar-accent-foreground',
               )}
             >
               <IconGlobe className="size-[16px]! shrink-0" />
@@ -1361,13 +1361,13 @@ function ChatSidebarVariant({
               <button
                 type="button"
                 onClick={onNewConversation}
-                className="flex h-[40px] w-full items-center justify-center gap-[8px] rounded-[10px] bg-[#18181a] px-[16px] text-[14px] font-medium text-white transition-colors hover:bg-[#303030]"
+                className="flex h-[40px] w-full items-center justify-center gap-[8px] rounded-[10px] bg-[var(--oem-sidebar-active-background)] px-[16px] text-[14px] font-medium text-[var(--oem-sidebar-active-foreground)] transition-opacity hover:opacity-90"
               >
                 <IconAdd className="size-[16px]! shrink-0" />
                 <span>新建对话</span>
               </button>
             )}
-            <span className="text-[12px] leading-none text-[#858b9c]">会话</span>
+            <span className="text-[12px] leading-none text-[var(--oem-sidebar-muted-foreground)]">会话</span>
           </div>
         </SidebarHeader>
 
@@ -1376,7 +1376,7 @@ function ChatSidebarVariant({
             {showSkeleton ? (
               <ChatSessionSkeletonList />
             ) : sessions.length === 0 ? (
-              <div className="flex flex-col items-center gap-[8px] py-[28px] text-center text-[12px] text-[#a2a8b8]">
+              <div className="flex flex-col items-center gap-[8px] py-[28px] text-center text-[12px] text-[var(--oem-sidebar-muted-foreground)]">
                 <StaffdeckIcon name="inbox" size={22} />
                 <span>暂无历史会话</span>
               </div>

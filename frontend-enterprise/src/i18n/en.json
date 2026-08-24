@@ -2973,5 +2973,10 @@
   "内部执行记录已归档": "Internal execution records archived",
   "正在整理采购清单": "Organizing the purchase list",
   "正在生成回复": "Generating reply",
-  "团队任务:整理采购清单": "Team task: Organize purchase list"
+  "团队任务:整理采购清单": "Team task: Organize purchase list",
+  "沙盒设置已保存，{1} 正在重启": "Sandbox settings saved. {1} is restarting.",
+  "仅管理员可修改。打开或关闭后保存将自动重启 {1}。默认关闭。": "Only administrators can change this setting. Saving after enabling or disabling it restarts {1} automatically. Disabled by default.",
+  "{1} 重启超时，请稍后手动刷新页面": "{1} restart timed out. Refresh the page manually in a moment.",
+  "对话过程将逐步推送实时执行步骤卡片（SOP 匹配 / 步骤 / 工具 / 知识检索），结束后定格。 可通过环境变量": "During the conversation, live execution cards are sent progressively for SOP matching, steps, tools, and knowledge retrieval, then remain fixed when complete. Use the environment variable",
+  "关闭。": "to disable this behavior."
 }

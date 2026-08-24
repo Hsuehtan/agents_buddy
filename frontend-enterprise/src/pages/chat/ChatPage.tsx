@@ -27,7 +27,7 @@ export default function ChatPage() {
           '--sidebar-width-icon': '72px',
         } as CSSProperties
       }
-      className="h-screen min-h-0 bg-[#fcfcfc] text-[#18181a]"
+      className="oem-app-shell h-screen min-h-0 bg-[#fcfcfc] text-[#18181a]"
     >
       <AppSidebar
         variant="chat"
@@ -55,7 +55,7 @@ export default function ChatPage() {
         onDeleteSession={chat.requestDelete}
         onOpenAdmin={chat.openAdmin}
       />
-      <main className={cn(CHAT_MAIN_CLASS, 'flex-1')}>
+      <main className={cn(CHAT_MAIN_CLASS, 'oem-workspace-frame flex-1')}>
         <ChatHeader chat={chat} />
         <MessageList chat={chat} />
         <Composer chat={chat} />

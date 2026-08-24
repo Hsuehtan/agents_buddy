@@ -495,7 +495,7 @@ function Shell({
           "--sidebar-width-icon": "72px",
         } as CSSProperties
       }
-      className={`app-shell ${sidebarExpanded ? "sidebar-expanded" : "sidebar-collapsed"} ${isAgentRosterRoute ? "is-agent-roster" : ""}`}
+      className={`app-shell oem-app-shell ${sidebarExpanded ? "sidebar-expanded" : "sidebar-collapsed"} ${isAgentRosterRoute ? "is-agent-roster" : ""}`}
     >
       <AppSidebar
         selected={selected}
@@ -519,7 +519,7 @@ function Shell({
         }}
         modelSetupAttention={isAdmin && showModelSetupNotice}
       />
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <div className="oem-workspace-frame flex min-h-0 min-w-0 flex-1 flex-col">
         <div
           className={`content flex-1 ${isDistillRoute ? "flex min-h-0 flex-col overflow-hidden p-0!" : ""} ${selected === "/enterprise/dashboard" ? "sd1-dashboard-content" : ""} ${selected !== "/enterprise/dashboard" && !isDistillRoute ? "sd1-management-content" : ""}`}
         >

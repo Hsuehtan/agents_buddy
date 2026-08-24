@@ -6,6 +6,7 @@ import type { EnterpriseAuthUser } from '../auth';
 import AccountApiKeyDialog from '../components/AccountApiKeyDialog';
 import type { UIConfigRead } from '../types';
 import { KeyRound, RotateCcw, ShieldCheck } from 'lucide-react';
+import { OEM_BRAND } from '../config/oem-brand';
 
 type UiConfigForm = {
   show_thinking_trace: boolean;
@@ -95,7 +96,7 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
       setEffectiveStoragePath(row.effective_harness_storage_path || '');
       if (row.restart_scheduled) {
         setRestarting(true);
-        notify.success('沙盒设置已保存，StaffDeck 正在重启');
+        notify.success(`沙盒设置已保存，${OEM_BRAND.productShortName} 正在重启`);
         await waitForApplicationRestart();
         window.location.reload();
         return;
@@ -130,7 +131,7 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
       <Card className="editor-card settings-card">
         <CardHeader><CardTitle className="flex items-center gap-[8px]"><ShieldCheck className="size-[16px]" />执行隔离与文件存储</CardTitle></CardHeader>
         <CardContent className="flex flex-col gap-[16px]">
-          <SwitchRow label="启用 SRT 沙盒" checked={form.sandbox_enabled} onChange={(next) => update({ sandbox_enabled: next })} hint="仅管理员可修改。打开或关闭后保存将自动重启 StaffDeck。默认关闭。" />
+          <SwitchRow label="启用 SRT 沙盒" checked={form.sandbox_enabled} onChange={(next) => update({ sandbox_enabled: next })} hint={`仅管理员可修改。打开或关闭后保存将自动重启 ${OEM_BRAND.productShortName}。默认关闭。`} />
           <div className={`whitespace-pre-line rounded-md border px-[12px] py-[10px] text-[12px] leading-[18px] ${sandboxStatus.sandbox_status === 'ready' ? 'border-emerald-200 bg-emerald-50 text-emerald-900' : sandboxStatus.sandbox_status === 'degraded' ? 'border-red-300 bg-red-50 text-red-900' : sandboxStatus.sandbox_status === 'disabled' ? 'border-slate-200 bg-slate-50 text-slate-700' : 'border-amber-200 bg-amber-50 text-amber-900'}`}>
             <div className="font-medium">沙盒状态：{sandboxStatus.sandbox_status === 'ready' ? '可用' : sandboxStatus.sandbox_status === 'degraded' ? '已降级为无沙盒（高风险）' : sandboxStatus.sandbox_status === 'disabled' ? '未启用' : '不可用'}</div>
             {sandboxStatus.sandbox_status_message && <div>{sandboxStatus.sandbox_status_message}</div>}
@@ -178,5 +179,5 @@ async function waitForApplicationRestart(): Promise<void> {
       await new Promise((resolve) => window.setTimeout(resolve, 1000));
     }
   }
-  throw new Error('StaffDeck 重启超时，请稍后手动刷新页面');
+  throw new Error(`${OEM_BRAND.productShortName} 重启超时，请稍后手动刷新页面`);
 }

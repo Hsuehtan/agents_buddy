@@ -36,7 +36,7 @@ export default function BrandLogo({
           {/* <span className="text-[12px] font-semibold leading-none text-[#0f136c]">
             OpenBMB
           </span> */}
-          <strong className="text-[17px] font-semibold leading-none text-[#18181a]">
+          <strong className="text-[17px] font-semibold leading-none text-sidebar-foreground">
             {OEM_BRAND.productShortName}
           </strong>
         </span>

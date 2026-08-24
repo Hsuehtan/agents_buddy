@@ -40,7 +40,7 @@ export default function ChatGalleryPage() {
           '--sidebar-width-icon': '72px',
         } as CSSProperties
       }
-      className="h-screen min-h-0 bg-[#fcfcfc] text-[#18181a]"
+      className="oem-app-shell h-screen min-h-0 bg-[#fcfcfc] text-[#18181a]"
     >
       <AppSidebar
         variant="chat"
@@ -62,7 +62,7 @@ export default function ChatGalleryPage() {
         onDeleteSession={chat.requestDelete}
         onOpenAdmin={chat.openAdmin}
       />
-      <main className="min-h-0 flex-1 overflow-y-auto">
+      <main className="oem-workspace-frame min-h-0 flex-1 overflow-y-auto">
         <EmployeeGalleryPage
           currentUser={auth?.user}
           isAdmin={isAdmin}

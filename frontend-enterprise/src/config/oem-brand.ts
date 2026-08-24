@@ -15,6 +15,19 @@ export type OemBrandConfig = {
   releaseUrl: string;
 };
 
+export type OemShellTheme = {
+  shellBackground: string;
+  shellOutline: string;
+  sidebarBackground: string;
+  sidebarForeground: string;
+  sidebarMutedForeground: string;
+  sidebarHoverBackground: string;
+  sidebarActiveBackground: string;
+  sidebarActiveForeground: string;
+  sidebarBorder: string;
+  sidebarFocusRing: string;
+};
+
 export const DEFAULT_OEM_BRAND: Readonly<OemBrandConfig> = Object.freeze({
   productName: 'StaffDeck',
   productShortName: 'StaffDeck',
@@ -30,6 +43,28 @@ export const DEFAULT_OEM_BRAND: Readonly<OemBrandConfig> = Object.freeze({
   supportUrl: '',
   documentationUrl: '',
   releaseUrl: '',
+});
+
+/**
+ * OEM application-shell palette. These values intentionally do not feed the
+ * workspace theme, so changing them cannot recolor business pages.
+ */
+export const DEFAULT_OEM_SHELL_THEME: Readonly<OemShellTheme> = Object.freeze({
+  shellBackground: '#071225',
+  shellOutline: '#6f9ed6',
+  sidebarBackground: '#071225',
+  sidebarForeground: '#d7e0ef',
+  sidebarMutedForeground: '#8fa0ba',
+  sidebarHoverBackground: '#132542',
+  sidebarActiveBackground: '#315fda',
+  sidebarActiveForeground: '#ffffff',
+  sidebarBorder: '#1c3150',
+  sidebarFocusRing: '#8bb7ee',
+});
+
+/** Change this object for each OEM build; invalid colors fall back at runtime. */
+export const OEM_SHELL_THEME: Readonly<OemShellTheme> = Object.freeze({
+  ...DEFAULT_OEM_SHELL_THEME,
 });
 
 function normalizedText(value: string | undefined, fallback: string): string {
@@ -92,6 +127,15 @@ export function createOemBrandConfig(
 }
 
 export const OEM_BRAND = createOemBrandConfig(import.meta.env);
+
+export function oemFilenamePrefix(brand: Readonly<OemBrandConfig> = OEM_BRAND): string {
+  const normalized = brand.productShortName
+    .normalize('NFKD')
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return normalized || 'export';
+}
 
 function imageMimeType(url: string): string | undefined {
   const pathname = url.split(/[?#]/, 1)[0].toLowerCase();

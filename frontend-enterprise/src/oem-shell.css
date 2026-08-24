@@ -1,0 +1,75 @@
+:root {
+  --oem-shell-background: #071225;
+  --oem-shell-outline: #6f9ed6;
+  --oem-sidebar-background: #071225;
+  --oem-sidebar-foreground: #d7e0ef;
+  --oem-sidebar-muted-foreground: #8fa0ba;
+  --oem-sidebar-hover-background: #132542;
+  --oem-sidebar-active-background: #315fda;
+  --oem-sidebar-active-foreground: #ffffff;
+  --oem-sidebar-border: #1c3150;
+  --oem-sidebar-focus-ring: #8bb7ee;
+}
+
+.oem-app-shell {
+  --sidebar: var(--oem-sidebar-background);
+  --sidebar-foreground: var(--oem-sidebar-foreground);
+  --sidebar-primary: var(--oem-sidebar-active-background);
+  --sidebar-primary-foreground: var(--oem-sidebar-active-foreground);
+  --sidebar-accent: var(--oem-sidebar-hover-background);
+  --sidebar-accent-foreground: var(--oem-sidebar-active-foreground);
+  --sidebar-border: var(--oem-sidebar-border);
+  --sidebar-ring: var(--oem-sidebar-focus-ring);
+
+  height: 100dvh;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--oem-shell-background);
+  box-shadow: inset 0 0 0 1px var(--oem-shell-outline);
+}
+
+.oem-app-shell [data-sidebar='sidebar'] [data-sidebar='menu-button'][data-active='true'],
+.oem-app-shell [data-sidebar='sidebar'] [aria-current='page'] {
+  background: var(--oem-sidebar-active-background);
+  color: var(--oem-sidebar-active-foreground);
+}
+
+.oem-app-shell [data-sidebar='sidebar'] button:focus-visible,
+.oem-app-shell [data-sidebar='sidebar'] [role='button']:focus-visible {
+  outline: 2px solid var(--oem-sidebar-focus-ring);
+  outline-offset: 2px;
+}
+
+.oem-app-shell [data-slot='sidebar-container'] {
+  border-right: 0;
+}
+
+.oem-workspace-frame {
+  min-width: 0;
+  min-height: 0;
+  margin: 10px;
+  overflow: hidden;
+  border: 1px solid var(--oem-shell-outline);
+  border-radius: 18px;
+  background: #fcfcfc;
+  box-shadow: 0 12px 32px rgb(1 9 24 / 16%);
+}
+
+.oem-workspace-frame > .content {
+  height: auto;
+  min-height: 0;
+}
+
+@media (max-width: 1023px) {
+  .oem-workspace-frame {
+    margin: 8px;
+    border-radius: 14px;
+  }
+}
+
+@media (max-width: 767px) {
+  .oem-workspace-frame {
+    margin: 6px;
+    border-radius: 12px;
+  }
+}
