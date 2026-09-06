@@ -559,14 +559,14 @@ export default function OpenPlatformPage({
   }
 
   return (
-    <div className="flex min-h-full flex-col box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px] xl:h-full xl:min-h-0 xl:overflow-hidden">
+    <div className="flex min-h-full flex-col box-border px-[48px] pt-[32px] pb-[43px] max-[900px]:px-[16px]">
       <AppHeader
         className="mb-[24px]"
         onLogout={onLogout}
         userName={currentUser?.username}
         title="开放广场平台"
       />
-      <div className="mx-auto grid w-full grid-cols-1 gap-[12px] sm:grid-cols-2 xl:min-h-0 xl:flex-1 xl:grid-cols-5 xl:grid-rows-1">
+      <div className="mx-auto flex w-full flex-col gap-[16px]">
         {platformStats.map((platform) => {
           const items = platformItems[platform.kind];
           const previews = items;
