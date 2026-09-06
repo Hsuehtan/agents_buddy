@@ -23,6 +23,7 @@ import {
 import { Maximize2, Minimize2, PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen } from 'lucide-react';
 import {
   useEffect,
+  useCallback,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -74,7 +75,9 @@ import {
 import { ModelConfigDropdown } from '@/components/ModelConfigDropdown';
 import { cn } from '@/lib/utils';
 import { isTeamScope, readEmployeeScope } from '@/lib/agent-scope-storage';
+import { subscribeEnterpriseCapabilityCatalogRefresh } from '@/lib/capability-catalog-events';
 import { SELECT_TRIGGER_CLASS } from '@/lib/enterprise-ui';
+import { formatHandoffAssigneeValue, parseHandoffAssigneeValue } from '@/lib/handoff-assignee';
 import type { EnterpriseAuthUser } from '../auth';
 import {
   ACTION_EMPTY_CLASS,
@@ -489,6 +492,42 @@ const DEFAULT_DISTILL_MESSAGES: ChatItem[] = [
   },
 ];
 const DISTILL_REWRITE_MODEL_STORAGE_KEY = 'skill-distill-rewrite-model';
+const _CHANNEL_LABELS: Record<string, string> = { feishu: '飞书', dingtalk: '钉钉', wecom: '企业微信', wechat: '微信', web: '网页端' };
+const UNASSIGNED_USER_VALUE = '__unassigned__';
+// 渠道转接通知运行时已支持飞书/企微私聊,处理人选项提供对应渠道标注
+// (后端同样拒绝其他渠道)。钉钉/微信适配器只能回会话内消息,不在此列。
+const HANDOFF_NOTIFY_CHANNELS = new Set(['feishu', 'wecom']);
+
+type HandoffAssigneeUser = {
+  id: string;
+  username: string;
+  display_name?: string;
+  source?: string;
+  channel_identities?: Array<{ channel: string; display_name?: string; external_user_id?: string }>;
+};
+
+export function handoffAssigneeUserOptions(tenantUsers: HandoffAssigneeUser[]): SelectOption[] {
+  // 内部成员一律可选(网页端投递);已绑定支持渠道身份的成员追加"姓名（渠道）"选项,
+  // 选中后运行时按该渠道转接。其他渠道身份不生成选项(通知未实现),
+  // 渠道懒建账号(渠道客户/群聊)也不进入处理人选项。
+  const options: SelectOption[] = [];
+  tenantUsers.filter((user) => !user.source || user.source === 'web').forEach((user) => {
+    const name = user.display_name || user.username || user.id;
+    options.push({ value: user.id, label: `${name}（${_CHANNEL_LABELS.web}）` });
+    const channels = new Set<string>();
+    (user.channel_identities || []).forEach((identity) => {
+      const channel = String(identity.channel || '').trim();
+      if (channel && HANDOFF_NOTIFY_CHANNELS.has(channel)) channels.add(channel);
+    });
+    channels.forEach((channel) => {
+      options.push({
+        value: `${user.id}::${channel}`,
+        label: `${name}（${_CHANNEL_LABELS[channel] || channel}）`,
+      });
+    });
+  });
+  return options;
+}
 
 type DistillCacheSnapshot = {
   draft: SkillCard | null;
@@ -605,7 +644,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     text: string;
     outgoingText: string;
   } | null>(null);
-  const [viewMode, setViewMode] = useState<ViewMode>('source');
+  const [viewMode, setViewMode] = useState<ViewMode>('flow');
   const [flowFullscreen, setFlowFullscreen] = useState(false);
   const [flowAssistantPanelOpen, setFlowAssistantPanelOpen] = useState(true);
   const [loading, setLoading] = useState(false);
@@ -618,6 +657,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   const [generalSkills, setGeneralSkills] = useState<GeneralSkillRead[]>([]);
   const [sopSkills, setSopSkills] = useState<SkillRead[]>([]);
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBaseRead[]>([]);
+  const [tenantUsers, setTenantUsers] = useState<Array<{ id: string; username: string; display_name?: string; source?: string; channel_identities?: Array<{ channel: string; display_name?: string; external_user_id?: string; external_account_scope?: string }> }>>([]);
   const [modelConfigs, setModelConfigs] = useState<ModelConfigRead[]>([]);
   const [selectedRewriteModelId, setSelectedRewriteModelId] = useState(
     () => window.localStorage.getItem(`${DISTILL_REWRITE_MODEL_STORAGE_KEY}:${TENANT_ID}`) || '',
@@ -631,6 +671,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
   const uploadControllersRef = useRef<Record<string, AbortController>>({});
   const dragDepthRef = useRef(0);
   const animationTimersRef = useRef<number[]>([]);
+  const capabilityCatalogRequestRef = useRef(0);
   const sourceScrollRef = useRef<HTMLDivElement | null>(null);
   const chatMessagesRef = useRef<HTMLDivElement | null>(null);
   const [cacheReady, setCacheReady] = useState(false);
@@ -673,7 +714,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         setDirtyPaths(cached.dirtyPaths);
         setTextDiffs(cached.textDiffs);
         setPendingChange(lockPendingChangeSkillId(cached.pendingChange, cachedLockedSkillId));
-        setViewMode(cached.viewMode || 'source');
+        setViewMode('flow');
         setAttachments(cached.attachments.filter((item) => item.status !== 'uploading'));
         setStreamStatus(cached.streamStatus);
         setActiveJob(cached.activeJob || null);
@@ -822,27 +863,49 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     };
   }, [active]);
 
+  const refreshCapabilityCatalog = useCallback(async () => {
+    if (!active) return;
+    const requestId = capabilityCatalogRequestRef.current + 1;
+    capabilityCatalogRequestRef.current = requestId;
+    const [toolResult, skillResult, knowledgeResult, sopResult] = await Promise.allSettled([
+      api.get<ToolRead[]>(`/api/enterprise/tools?tenant_id=${TENANT_ID}${agentQuery}`),
+      api.get<GeneralSkillRead[]>(
+        `/api/enterprise/general-skills?tenant_id=${TENANT_ID}${agentQuery}`,
+      ),
+      api.get<KnowledgeBaseRead[]>(
+        `/api/enterprise/knowledge-bases?tenant_id=${TENANT_ID}${agentQuery}`,
+      ),
+      api.get<SkillRead[]>(`/api/enterprise/skills?tenant_id=${TENANT_ID}${agentQuery}`),
+    ]);
+    if (requestId !== capabilityCatalogRequestRef.current) return;
+    if (toolResult.status === 'fulfilled') setTools(toolResult.value);
+    if (skillResult.status === 'fulfilled') setGeneralSkills(skillResult.value);
+    if (knowledgeResult.status === 'fulfilled') setKnowledgeBases(knowledgeResult.value);
+    if (sopResult.status === 'fulfilled') setSopSkills(sopResult.value);
+  }, [active, agentQuery]);
+
   useEffect(() => {
-    void Promise.all([
-      api
-        .get<ToolRead[]>(`/api/enterprise/tools?tenant_id=${TENANT_ID}${agentQuery}`)
-        .catch(() => [] as ToolRead[]),
-      api
-        .get<GeneralSkillRead[]>(`/api/enterprise/general-skills?tenant_id=${TENANT_ID}${agentQuery}`)
-        .catch(() => [] as GeneralSkillRead[]),
-      api
-        .get<KnowledgeBaseRead[]>(`/api/enterprise/knowledge-bases?tenant_id=${TENANT_ID}${agentQuery}`)
-        .catch(() => [] as KnowledgeBaseRead[]),
-      api
-        .get<SkillRead[]>(`/api/enterprise/skills?tenant_id=${TENANT_ID}${agentQuery}`)
-        .catch(() => [] as SkillRead[]),
-    ]).then(([toolRows, skillRows, knowledgeRows, sopRows]) => {
-      setTools(toolRows);
-      setGeneralSkills(skillRows);
-      setKnowledgeBases(knowledgeRows);
-      setSopSkills(sopRows);
+    void refreshCapabilityCatalog();
+    return () => {
+      capabilityCatalogRequestRef.current += 1;
+    };
+  }, [refreshCapabilityCatalog]);
+
+  useEffect(() => {
+    if (!active) return;
+    return subscribeEnterpriseCapabilityCatalogRefresh(() => {
+      void refreshCapabilityCatalog();
     });
-  }, [agentQuery]);
+  }, [active, refreshCapabilityCatalog]);
+
+  useEffect(() => {
+    api
+      .get<Array<{ id: string; username: string; display_name?: string; source?: string; channel_identities?: Array<{ channel: string; display_name?: string; external_user_id?: string }> }>>(
+        `/api/auth/users?tenant_id=${TENANT_ID}&include_channel=true`,
+      )
+      .then(setTenantUsers)
+      .catch(() => setTenantUsers([]));
+  }, []);
 
   useEffect(() => {
     api
@@ -962,7 +1025,12 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
     try {
       await streamPost(
         '/api/enterprise/skills/distill/stream',
-        { tenant_id: TENANT_ID, ...payload, model_config_id: selectedRewriteModelId || undefined },
+        {
+          tenant_id: TENANT_ID,
+          agent_id: activeAgentId || undefined,
+          ...payload,
+          model_config_id: selectedRewriteModelId || undefined,
+        },
         (item) => {
           trackActiveJobEvent(item, baseJob);
           if (item.event === 'status') {
@@ -1081,6 +1149,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
         `/api/enterprise/skills/${encodeURIComponent(editableDraft.skill_id)}/rewrite/stream`,
         {
           tenant_id: TENANT_ID,
+          agent_id: activeAgentId || undefined,
           current_skill: editableDraft,
           instruction: text,
           model_config_id: selectedRewriteModelId || undefined,
@@ -1190,7 +1259,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
       return;
     }
     let finalDraft: SkillCard = canonicalizeSkillCapabilityRefs(
-      lockSkillIdForDraft(saveReviewDraft, lockedSkillId),
+      normalizeSubflowNodes(lockSkillIdForDraft(saveReviewDraft, lockedSkillId)),
     );
     let renamedSkillId = '';
     try {
@@ -2614,6 +2683,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
               sopSkills={sopSkills}
               tools={tools}
               knowledgeBases={knowledgeBases}
+              tenantUsers={tenantUsers}
               containerRef={sourceScrollRef}
               lockSkillId={Boolean(lockedSkillId)}
               onToggle={toggleTarget}
@@ -2634,6 +2704,7 @@ export default function DistillPage({ active = true, searchParamsOverride, curre
                 sopSkills={sopSkills}
                 tools={tools}
                 knowledgeBases={knowledgeBases}
+                tenantUsers={tenantUsers}
                 containerRef={sourceScrollRef}
                 lockSkillId={Boolean(lockedSkillId)}
                 assistantPanelOpen={flowAssistantPanelOpen}
@@ -3158,6 +3229,7 @@ function SkillSource({
   sopSkills,
   tools,
   knowledgeBases,
+  tenantUsers,
   containerRef,
   lockSkillId,
   onToggle,
@@ -3175,6 +3247,7 @@ function SkillSource({
   sopSkills: SkillRead[];
   tools: ToolRead[];
   knowledgeBases: KnowledgeBaseRead[];
+  tenantUsers: Array<{ id: string; username: string; display_name?: string; source?: string; channel_identities?: Array<{ channel: string; display_name?: string; external_user_id?: string }> }>;
   containerRef: RefObject<HTMLDivElement>;
   lockSkillId?: boolean;
   onToggle: (target: TargetSelection) => void;
@@ -3245,7 +3318,13 @@ function SkillSource({
       onEdit(next, stepTargetPath(index));
       return;
     }
-    if (CAPABILITY_REFERENCE_FIELDS.includes(nodeField)) {
+    if (nodeField === 'assignee_user_id') {
+      const { userId, channel } = parseHandoffAssigneeValue(String(listValue));
+      currentNode.assignee_user_id = userId || null;
+      currentNode.assignee_notify_channel = userId ? channel : null;
+    } else if (nodeField === 'type') {
+      applyNodeTypeChange(currentNode, String(listValue));
+    } else if (CAPABILITY_REFERENCE_FIELDS.includes(nodeField)) {
       const currentRefs = nodeCapabilityRefs(currentNode);
       currentNode.capability_refs = updateCapabilityRefs(
         currentRefs,
@@ -3261,7 +3340,7 @@ function SkillSource({
     } else {
       currentNode[nodeField] = listValue;
     }
-    next.nodes[index] = currentNode;
+    next.nodes[index] = normalizeSubflowNode(currentNode);
     onEdit(next, stepTargetPath(index));
   }
 
@@ -3532,11 +3611,19 @@ function SkillSource({
     unavailableReason: item.status === 'active' || item.status === 'published' ? undefined : '知识库已下线',
   }));
   const sopOptions: SelectOption[] = sopSkills
-    .filter((item) => item.status === 'published' && item.skill_id !== skill.skill_id)
+    .filter((item) => (
+      item.status === 'published'
+      && item.skill_id !== skill.skill_id
+      && !wouldCreateSopNestingCycle(skill.skill_id, item.skill_id, sopSkills)
+    ))
     .map((item) => ({
       value: item.skill_id,
       label: `${item.name} · ${item.skill_id}`,
     }));
+  const tenantUserOptions: SelectOption[] = [
+    { value: UNASSIGNED_USER_VALUE, label: '未指定（使用渠道默认）' },
+    ...handoffAssigneeUserOptions(tenantUsers),
+  ];
 
   return (
     <div className={SOURCE_MD_CLASS} ref={containerRef}>
@@ -3593,6 +3680,10 @@ function SkillSource({
           const stepId = String(step.node_id || step.step_id || `node_${index + 1}`);
           const path = stepTargetPath(index);
           const outgoingEdges = edgeMap[stepId] || [];
+          const isSubflow = String(step.type || '') === 'subflow';
+          // 处理人仅对 handoff 节点有意义;转人工动作只允许出现在 handoff 节点上,
+          // 回复/收集等其他节点一律不展示处理人与转人工动作。
+          const isHandoffNode = String(step.type || '') === 'handoff';
           const nodeState = [
             stepId === startNodeId ? '起始节点' : '',
             Boolean(step.optional) ? '可选' : '必选',
@@ -3637,7 +3728,7 @@ function SkillSource({
                       options={NODE_TYPE_OPTIONS}
                       onChange={(value) => editStep(index, 'type', value)}
                     />
-                    {String(step.type || '') === 'subflow' && (
+                    {isSubflow && (
                       <EditableSourceSelectLine
                         label="调用子 SOP"
                         value={String(step.sub_sop_id || '')}
@@ -3646,48 +3737,37 @@ function SkillSource({
                       />
                     )}
                     <SourceReadonlyLine label="节点状态" value={nodeState} />
-                    <EditableSourceTextLine
-                      label={fieldLabel('instruction')}
-                      value={String(step.instruction || '')}
-                      multiline
-                      collapsible
-                      onChange={(value) => editStep(index, 'instruction', value)}
-                    />
-                    <EditableSourceListLine label={fieldLabel('expected_user_info')} values={asStringList(step.expected_user_info)} onChange={(value) => editStep(index, 'expected_user_info', value)} />
-                    <EditableSourceActionLine
-                      values={asStringList(step.allowed_actions)}
-                      options={actionOptions}
-                      toolDescriptions={toolDescriptions}
-                      toolStatuses={toolStatuses}
-                      onChange={(value) => editStep(index, 'allowed_actions', value)}
-                    />
-                    <EditableCapabilityReferencesLine
-                      label="SOP 技能"
-                      values={asStringList(step.general_skill_ids)}
-                      requiredValues={asStringList(step.required_general_skill_ids)}
-                      options={generalSkillOptions}
-                      emptyText="未指定技能"
-                      onChange={(value) => editStep(index, 'general_skill_ids', value)}
-                      onRequiredChange={(value) => editStep(index, 'required_general_skill_ids', value)}
-                    />
-                    <EditableCapabilityReferencesLine
-                      label="SOP 工具"
-                      values={asStringList(step.tool_ids)}
-                      requiredValues={asStringList(step.required_tool_ids)}
-                      options={toolOptions}
-                      emptyText="未指定工具"
-                      onChange={(value) => editStep(index, 'tool_ids', value)}
-                      onRequiredChange={(value) => editStep(index, 'required_tool_ids', value)}
-                    />
-                    <EditableCapabilityReferencesLine
-                      label="SOP 知识库"
-                      values={asStringList(step.knowledge_base_ids)}
-                      requiredValues={asStringList(step.required_knowledge_base_ids)}
-                      options={knowledgeBaseOptions}
-                      emptyText="未指定知识库"
-                      onChange={(value) => editStep(index, 'knowledge_base_ids', value)}
-                      onRequiredChange={(value) => editStep(index, 'required_knowledge_base_ids', value)}
-                    />
+                    {isSubflow ? (
+                      <SourceReadonlyLine label="执行职责" value="仅进入所选子 SOP；父子流程共享当前 TaskFrame 字段。" />
+                    ) : (
+                      <>
+                        <EditableSourceTextLine label={fieldLabel('instruction')} value={String(step.instruction || '')} multiline collapsible onChange={(value) => editStep(index, 'instruction', value)} />
+                        <EditableSourceListLine label={fieldLabel('expected_user_info')} values={asStringList(step.expected_user_info)} onChange={(value) => editStep(index, 'expected_user_info', value)} />
+                        <EditableSourceActionLine values={asStringList(step.allowed_actions)} options={filterActionOptionsForNodeType(actionOptions, String(step.type || ''))} toolDescriptions={toolDescriptions} toolStatuses={toolStatuses} onChange={(value) => editStep(index, 'allowed_actions', value)} />
+                        <EditableCapabilityReferencesLine label="SOP 技能" values={asStringList(step.general_skill_ids)} requiredValues={asStringList(step.required_general_skill_ids)} options={generalSkillOptions} emptyText="未指定技能" onChange={(value) => editStep(index, 'general_skill_ids', value)} onRequiredChange={(value) => editStep(index, 'required_general_skill_ids', value)} />
+                        <EditableCapabilityReferencesLine label="SOP 工具" values={asStringList(step.tool_ids)} requiredValues={asStringList(step.required_tool_ids)} options={toolOptions} emptyText="未指定工具" onChange={(value) => editStep(index, 'tool_ids', value)} onRequiredChange={(value) => editStep(index, 'required_tool_ids', value)} />
+                        <EditableCapabilityReferencesLine label="SOP 知识库" values={asStringList(step.knowledge_base_ids)} requiredValues={asStringList(step.required_knowledge_base_ids)} options={knowledgeBaseOptions} emptyText="未指定知识库" onChange={(value) => editStep(index, 'knowledge_base_ids', value)} onRequiredChange={(value) => editStep(index, 'required_knowledge_base_ids', value)} />
+                      </>
+                    )}
+                    {isHandoffNode && (
+                      <EditableSourceSelectLine
+                        label="处理人"
+                        value={
+                          step.assignee_user_id
+                            ? formatHandoffAssigneeValue(
+                              String(step.assignee_user_id),
+                              String(step.assignee_notify_channel || ''),
+                            )
+                            : UNASSIGNED_USER_VALUE
+                        }
+                        options={tenantUserOptions}
+                        onChange={(value) => editStep(
+                          index,
+                          'assignee_user_id',
+                          value === UNASSIGNED_USER_VALUE ? '' : value,
+                        )}
+                      />
+                    )}
                     <EditableFlowRulesLine
                       sourceNodeId={stepId}
                       edges={outgoingEdges}
@@ -3698,11 +3778,8 @@ function SkillSource({
                       onUpdate={(edgeIndex, patch) => updateEdge(index, edgeIndex, patch)}
                       onDelete={(edgeIndex) => deleteEdge(index, edgeIndex)}
                     />
-                    <SourceJsonLine label="知识范围" value={step.knowledge_scope} />
-                    <EditableRetryPolicyLine
-                      value={step.retry_policy}
-                      onChange={(value) => editStep(index, 'retry_policy', value)}
-                    />
+                    {!isSubflow && <SourceJsonLine label="知识范围" value={step.knowledge_scope} />}
+                    {!isSubflow && <EditableRetryPolicyLine value={step.retry_policy} onChange={(value) => editStep(index, 'retry_policy', value)} />}
                   </div>
                 </div>
               </SelectableTarget>
@@ -3736,6 +3813,7 @@ function SkillFlow({
   sopSkills,
   tools,
   knowledgeBases,
+  tenantUsers,
   containerRef,
   lockSkillId,
   assistantPanelOpen,
@@ -3756,6 +3834,7 @@ function SkillFlow({
   sopSkills: SkillRead[];
   tools: ToolRead[];
   knowledgeBases: KnowledgeBaseRead[];
+  tenantUsers: Array<{ id: string; username: string; display_name?: string; source?: string; channel_identities?: Array<{ channel: string; display_name?: string; external_user_id?: string }> }>;
   containerRef: RefObject<HTMLDivElement>;
   lockSkillId?: boolean;
   assistantPanelOpen: boolean;
@@ -3824,6 +3903,11 @@ function SkillFlow({
     return { value: nodeId, label: `Node ${index + 1} · ${String(node.name || nodeId)}` };
   });
   const actionOptions = buildActionOptions(toolDescriptions, toolStatuses, nodes);
+  // 流程视图当前选中的节点在非 handoff 类型下不提供转人工动作
+  const selectedNodeType = selectedNodeIndex === null
+    ? ''
+    : String(nodes[selectedNodeIndex]?.type || '');
+  const inspectorActionOptions = filterActionOptionsForNodeType(actionOptions, selectedNodeType);
   const generalSkillOptions: CapabilityReferenceOption[] = generalSkills.map((item) => ({
     value: item.id,
     label: item.name || item.slug,
@@ -3846,11 +3930,19 @@ function SkillFlow({
     unavailableReason: item.status === 'active' || item.status === 'published' ? undefined : '知识库已下线',
   }));
   const sopOptions: SelectOption[] = sopSkills
-    .filter((item) => item.status === 'published' && item.skill_id !== skill.skill_id)
+    .filter((item) => (
+      item.status === 'published'
+      && item.skill_id !== skill.skill_id
+      && !wouldCreateSopNestingCycle(skill.skill_id, item.skill_id, sopSkills)
+    ))
     .map((item) => ({
       value: item.skill_id,
       label: `${item.name} · ${item.skill_id}`,
     }));
+  const tenantUserOptions: SelectOption[] = [
+    { value: UNASSIGNED_USER_VALUE, label: '未指定（使用渠道默认）' },
+    ...handoffAssigneeUserOptions(tenantUsers),
+  ];
 
   const editFlowNode = (
     index: number,
@@ -3895,6 +3987,12 @@ function SkillFlow({
       }));
       if (next.start_node_id === previousId) next.start_node_id = nextId;
       next.terminal_node_ids = asStringList(next.terminal_node_ids).map((nodeId) => (nodeId === previousId ? nextId : nodeId));
+    } else if (nodeField === 'assignee_user_id') {
+      const { userId, channel } = parseHandoffAssigneeValue(String(listValue));
+      currentNode.assignee_user_id = userId || null;
+      currentNode.assignee_notify_channel = userId ? channel : null;
+    } else if (nodeField === 'type') {
+      applyNodeTypeChange(currentNode, String(listValue));
     } else if (CAPABILITY_REFERENCE_FIELDS.includes(nodeField)) {
       const currentRefs = nodeCapabilityRefs(currentNode);
       currentNode.capability_refs = updateCapabilityRefs(
@@ -3911,7 +4009,7 @@ function SkillFlow({
     } else {
       currentNode[nodeField] = listValue;
     }
-    next.nodes[index] = currentNode;
+    next.nodes[index] = normalizeSubflowNode(currentNode);
     onEdit(next, stepTargetPath(index));
   };
 
@@ -4620,7 +4718,7 @@ function SkillFlow({
                   <button
                     type="button"
                     className={cn(
-                      'pointer-events-none grid size-[18px] shrink-0 place-items-center rounded-full border border-transparent bg-transparent p-0 text-[15px] leading-none text-[#858b9c] opacity-0 transition-[opacity,background,color,border-color] hover:border-[#fecaca] hover:bg-[#fee2e2] hover:text-[#b42318] focus-visible:pointer-events-auto focus-visible:opacity-100 focus-visible:outline-none',
+                      'pointer-events-none absolute right-[-8px] top-[-9px] z-[2] grid size-[20px] place-items-center rounded-full border border-[#e3e7ec] bg-white p-0 text-[15px] leading-none text-[#858b9c] opacity-0 shadow-[0_4px_10px_rgba(24,31,45,0.12)] transition-[opacity,background,color,border-color] hover:border-[#fecaca] hover:bg-[#fee2e2] hover:text-[#b42318] focus-visible:pointer-events-auto focus-visible:opacity-100 focus-visible:outline-none',
                       (hoveredEdgeId === edge.id || selectedEdgeId === edge.id)
                         && 'pointer-events-auto opacity-100',
                     )}
@@ -4699,6 +4797,7 @@ function SkillFlow({
                   textDiffs={textDiffs}
                   toolDescriptions={toolDescriptions}
                   toolStatuses={toolStatuses}
+                  sopSkills={sopSkills}
                   selected={selectedNodeId === item.nodeId}
                   connecting={connectionDrag?.sourceNodeId === item.nodeId || armedConnectionSourceId === item.nodeId}
                   dropTarget={connectionDrag?.targetNodeId === item.nodeId}
@@ -4738,13 +4837,14 @@ function SkillFlow({
             nodeOptions={nodeOptions}
             outgoingEdges={selectedNodeId ? edgeMap[selectedNodeId] || [] : []}
             terminal={selectedNodeId ? terminalSet.has(selectedNodeId) : false}
-            actionOptions={actionOptions}
+            actionOptions={inspectorActionOptions}
             toolDescriptions={toolDescriptions}
             toolStatuses={toolStatuses}
             generalSkillOptions={generalSkillOptions}
             toolOptions={toolOptions}
             knowledgeBaseOptions={knowledgeBaseOptions}
             sopOptions={sopOptions}
+            tenantUserOptions={tenantUserOptions}
             onEditNode={editFlowNode}
             onAddEdge={addFlowEdge}
             onUpdateEdge={updateFlowEdge}
@@ -4871,6 +4971,7 @@ function SkillFlowInspector({
   toolOptions,
   knowledgeBaseOptions,
   sopOptions,
+  tenantUserOptions,
   onEditNode,
   onAddEdge,
   onUpdateEdge,
@@ -4890,6 +4991,7 @@ function SkillFlowInspector({
   toolOptions: CapabilityReferenceOption[];
   knowledgeBaseOptions: CapabilityReferenceOption[];
   sopOptions: SelectOption[];
+  tenantUserOptions: SelectOption[];
   onEditNode: (index: number, field: string, value: string | string[] | boolean | Record<string, unknown>) => void;
   onAddEdge: (index: number) => void;
   onUpdateEdge: (index: number, edgeIndex: number, patch: Record<string, unknown>) => void;
@@ -4908,6 +5010,10 @@ function SkillFlowInspector({
     Boolean(node.optional) ? '可选' : '必选',
     terminal ? '终止节点' : '流程节点',
   ].join(' · ');
+  const isSubflow = String(node.type || '') === 'subflow';
+  // 处理人仅对 handoff 节点有意义;转人工动作只允许出现在 handoff 节点上,
+  // 回复/收集等其他节点一律不展示处理人与转人工动作。
+  const isHandoffNode = String(node.type || '') === 'handoff';
   return (
     <aside className={FLOW_INSPECTOR_CLASS} aria-label={`编辑节点 ${String(node.name || nodeId)}`}>
       <div className={FLOW_INSPECTOR_HEADER_CLASS}>
@@ -4932,21 +5038,48 @@ function SkillFlowInspector({
               />
             )}
             <SourceReadonlyLine label="节点状态" value={nodeState} />
-            <EditableSourceTextLine label={fieldLabel('instruction')} value={String(node.instruction || '')} multiline onChange={(value) => onEditNode(nodeIndex, 'instruction', value)} />
+            {isSubflow ? (
+              <SourceReadonlyLine label="执行职责" value="仅进入所选子 SOP；字段、动作和能力由子 SOP 自己定义。" />
+            ) : (
+              <EditableSourceTextLine label={fieldLabel('instruction')} value={String(node.instruction || '')} multiline onChange={(value) => onEditNode(nodeIndex, 'instruction', value)} />
+            )}
+            {isHandoffNode && (
+              <EditableSourceSelectLine
+                label="处理人"
+                value={
+                  node.assignee_user_id
+                    ? formatHandoffAssigneeValue(
+                      String(node.assignee_user_id),
+                      String(node.assignee_notify_channel || ''),
+                    )
+                    : UNASSIGNED_USER_VALUE
+                }
+                options={tenantUserOptions}
+                onChange={(value) => onEditNode(
+                  nodeIndex,
+                  'assignee_user_id',
+                  value === UNASSIGNED_USER_VALUE ? '' : value,
+                )}
+              />
+            )}
           </FlowInspectorSection>
-          <FlowInspectorSection title="输入与允许动作" description="明确本节点需要收集的字段，以及模型可以自主选择的动作。">
-            <EditableSourceListLine label={fieldLabel('expected_user_info')} values={asStringList(node.expected_user_info)} onChange={(value) => onEditNode(nodeIndex, 'expected_user_info', value)} />
-            <EditableSourceActionLine values={asStringList(node.allowed_actions)} options={actionOptions} toolDescriptions={toolDescriptions} toolStatuses={toolStatuses} onChange={(value) => onEditNode(nodeIndex, 'allowed_actions', value)} />
-          </FlowInspectorSection>
-          <FlowInspectorSection title="节点专用能力" description="SOP-specific 能力只有在这里明确引用后，才会进入当前节点的 Harness 能力清单。">
-            <EditableCapabilityReferencesLine label="SOP 技能" values={asStringList(node.general_skill_ids)} requiredValues={asStringList(node.required_general_skill_ids)} options={generalSkillOptions} emptyText="未指定技能" onChange={(value) => onEditNode(nodeIndex, 'general_skill_ids', value)} onRequiredChange={(value) => onEditNode(nodeIndex, 'required_general_skill_ids', value)} />
-            <EditableCapabilityReferencesLine label="SOP 工具" values={asStringList(node.tool_ids)} requiredValues={asStringList(node.required_tool_ids)} options={toolOptions} emptyText="未指定工具" onChange={(value) => onEditNode(nodeIndex, 'tool_ids', value)} onRequiredChange={(value) => onEditNode(nodeIndex, 'required_tool_ids', value)} />
-            <EditableCapabilityReferencesLine label="SOP 知识库" values={asStringList(node.knowledge_base_ids)} requiredValues={asStringList(node.required_knowledge_base_ids)} options={knowledgeBaseOptions} emptyText="未指定知识库" onChange={(value) => onEditNode(nodeIndex, 'knowledge_base_ids', value)} onRequiredChange={(value) => onEditNode(nodeIndex, 'required_knowledge_base_ids', value)} />
-          </FlowInspectorSection>
+          {!isSubflow && (
+            <>
+              <FlowInspectorSection title="输入与允许动作" description="明确本节点需要收集的字段，以及模型可以自主选择的动作。">
+                <EditableSourceListLine label={fieldLabel('expected_user_info')} values={asStringList(node.expected_user_info)} onChange={(value) => onEditNode(nodeIndex, 'expected_user_info', value)} />
+                <EditableSourceActionLine values={asStringList(node.allowed_actions)} options={actionOptions} toolDescriptions={toolDescriptions} toolStatuses={toolStatuses} onChange={(value) => onEditNode(nodeIndex, 'allowed_actions', value)} />
+              </FlowInspectorSection>
+              <FlowInspectorSection title="节点专用能力" description="SOP-specific 能力只有在这里明确引用后，才会进入当前节点的 Harness 能力清单。">
+                <EditableCapabilityReferencesLine label="SOP 技能" values={asStringList(node.general_skill_ids)} requiredValues={asStringList(node.required_general_skill_ids)} options={generalSkillOptions} emptyText="未指定技能" onChange={(value) => onEditNode(nodeIndex, 'general_skill_ids', value)} onRequiredChange={(value) => onEditNode(nodeIndex, 'required_general_skill_ids', value)} />
+                <EditableCapabilityReferencesLine label="SOP 工具" values={asStringList(node.tool_ids)} requiredValues={asStringList(node.required_tool_ids)} options={toolOptions} emptyText="未指定工具" onChange={(value) => onEditNode(nodeIndex, 'tool_ids', value)} onRequiredChange={(value) => onEditNode(nodeIndex, 'required_tool_ids', value)} />
+                <EditableCapabilityReferencesLine label="SOP 知识库" values={asStringList(node.knowledge_base_ids)} requiredValues={asStringList(node.required_knowledge_base_ids)} options={knowledgeBaseOptions} emptyText="未指定知识库" onChange={(value) => onEditNode(nodeIndex, 'knowledge_base_ids', value)} onRequiredChange={(value) => onEditNode(nodeIndex, 'required_knowledge_base_ids', value)} />
+              </FlowInspectorSection>
+            </>
+          )}
           <FlowInspectorSection title="流转与失败处理" description="按优先级判断规则；未命中时使用重试策略或终止流程。">
             <EditableFlowRulesLine sourceNodeId={nodeId} edges={outgoingEdges} nodes={nodes} nodeOptions={nodeOptions} terminal={terminal} onAdd={() => onAddEdge(nodeIndex)} onUpdate={(edgeIndex, patch) => onUpdateEdge(nodeIndex, edgeIndex, patch)} onDelete={(edgeIndex) => onDeleteEdge(nodeIndex, edgeIndex)} />
-            <SourceJsonLine label="知识范围" value={node.knowledge_scope} />
-            <EditableRetryPolicyLine value={node.retry_policy} onChange={(value) => onEditNode(nodeIndex, 'retry_policy', value)} />
+            {!isSubflow && <SourceJsonLine label="知识范围" value={node.knowledge_scope} />}
+            {!isSubflow && <EditableRetryPolicyLine value={node.retry_policy} onChange={(value) => onEditNode(nodeIndex, 'retry_policy', value)} />}
           </FlowInspectorSection>
         </div>
       </div>
@@ -4966,6 +5099,7 @@ function SkillFlowNodeCard({
   textDiffs,
   toolDescriptions,
   toolStatuses,
+  sopSkills,
   selected,
   connecting,
   dropTarget,
@@ -4987,6 +5121,7 @@ function SkillFlowNodeCard({
   textDiffs: TextDiffAnimation[];
   toolDescriptions: ToolDescriptionMap;
   toolStatuses: ToolStatusMap;
+  sopSkills: SkillRead[];
   selected: boolean;
   connecting: boolean;
   dropTarget: boolean;
@@ -5002,6 +5137,10 @@ function SkillFlowNodeCard({
   const expectedInfo = asStringList(step.expected_user_info);
   const actionList = asStringList(step.allowed_actions);
   const instruction = String(step.instruction || '暂无说明');
+  const isSubflow = String(step.type || '') === 'subflow';
+  const childSop = isSubflow
+    ? sopSkills.find((item) => item.skill_id === String(step.sub_sop_id || ''))
+    : undefined;
   return (
     <div className={FLOW_NODE_SHELL_CLASS}>
       <SelectableTarget
@@ -5026,17 +5165,21 @@ function SkillFlowNodeCard({
           {Boolean(step.optional) && <span className={FLOW_CHIP_CLASS}>可选</span>}
           {terminal && <span className={FLOW_CHIP_CLASS}>终止</span>}
         </div>
-        <p className={FLOW_NODE_SUMMARY_CLASS} title={instruction}>
-          <InlineDiffText path={path} field="instruction" value={instruction} diffs={textDiffs} />
-        </p>
+        {isSubflow ? (
+          <NestedSopPreview childSop={childSop} subSopId={String(step.sub_sop_id || '')} />
+        ) : (
+          <p className={FLOW_NODE_SUMMARY_CLASS} title={instruction}>
+            <InlineDiffText path={path} field="instruction" value={instruction} diffs={textDiffs} />
+          </p>
+        )}
         <div className={FLOW_COMPACT_META_CLASS}>
-          {expectedInfo.length > 0 && (
+          {!isSubflow && expectedInfo.length > 0 && (
             <div className={FLOW_COMPACT_ROW_CLASS}>
               <span>字段</span>
               <PlainChipList values={expectedInfo} />
             </div>
           )}
-          {actionList.length > 0 && (
+          {!isSubflow && actionList.length > 0 && (
             <div className={FLOW_COMPACT_ROW_CLASS}>
               <span>动作</span>
               <FlowActionList actions={actionList} toolDescriptions={toolDescriptions} toolStatuses={toolStatuses} />
@@ -5058,6 +5201,37 @@ function SkillFlowNodeCard({
         >
           +
         </button>
+      )}
+    </div>
+  );
+}
+
+function NestedSopPreview({ childSop, subSopId }: { childSop?: SkillRead; subSopId: string }) {
+  const childNodes = childSop ? skillGraphSteps(childSop.content) : [];
+  const visibleNodes = childNodes.slice(0, 4);
+  return (
+    <div className="grid gap-[7px] rounded-[10px] border border-[#cfe5df] bg-[#f3faf7] p-[9px] text-[#315e59]">
+      <div className="flex min-w-0 items-center justify-between gap-[8px]">
+        <strong className="truncate text-[12px] font-semibold">{childSop?.name || '未找到子 SOP'}</strong>
+        <span className="shrink-0 rounded-full bg-white px-[7px] py-[2px] text-[10px] text-[#04756f]">共享字段</span>
+      </div>
+      <span className="truncate font-mono text-[10px] text-[#66817d]">{subSopId || '尚未选择 SOP'}</span>
+      {visibleNodes.length > 0 ? (
+        <div className="flex min-w-0 items-center gap-[4px] overflow-hidden" aria-label="子 SOP 节点预览">
+          {visibleNodes.map((node, index) => (
+            <div className="contents" key={String(node.node_id || index)}>
+              {index > 0 && <span className="shrink-0 text-[#8aa39f]">→</span>}
+              <span className="min-w-0 truncate rounded-md border border-[#d8e9e4] bg-white px-[6px] py-[3px] text-[10px]">
+                {String(node.name || node.node_id || `节点 ${index + 1}`)}
+              </span>
+            </div>
+          ))}
+          {childNodes.length > visibleNodes.length && (
+            <span className="shrink-0 text-[10px] text-[#66817d]">+{childNodes.length - visibleNodes.length}</span>
+          )}
+        </div>
+      ) : (
+        <span className="text-[10px] text-[#8a9694]">发布子 SOP 后将在这里显示其流程节点</span>
       )}
     </div>
   );
@@ -5128,6 +5302,8 @@ function skillGraphSteps(skill: SkillCard): Array<Record<string, unknown>> {
         retry_policy: isRecord(node.retry_policy) ? node.retry_policy : {},
         metadata: isRecord(node.metadata) ? node.metadata : {},
         sub_sop_id: stringValue(node.sub_sop_id, ''),
+        assignee_user_id: stringValue(node.assignee_user_id, ''),
+        assignee_notify_channel: stringValue(node.assignee_notify_channel, ''),
       };
     });
   }
@@ -6404,7 +6580,11 @@ export function EditableCapabilityReferencesLine({
   onRequiredChange: (value: string[]) => void;
 }) {
   const [query, setQuery] = useState('');
-  const mergedOptions = mergeCapabilityReferenceOptions(options, values);
+  const selectedValues = new Set(values);
+  const mergedOptions = mergeCapabilityReferenceOptions(
+    options.filter((option) => !option.unavailableReason || selectedValues.has(option.value)),
+    values,
+  );
   const selected = new Set(values);
   const required = new Set(requiredValues);
   const normalizedQuery = query.trim().toLowerCase();
@@ -7177,6 +7357,8 @@ function parseNodeFragment(fragment: string, index: number): Record<string, unkn
   const instruction = extractJsonStringField(fragment, 'instruction') || '';
   const condition = extractJsonStringField(fragment, 'condition') || '';
   const subSopId = extractJsonStringField(fragment, 'sub_sop_id') || '';
+  const assigneeUserId = extractJsonStringField(fragment, 'assignee_user_id') || '';
+  const assigneeNotifyChannel = extractJsonStringField(fragment, 'assignee_notify_channel') || '';
   const expectedUserInfo = extractJsonStringArrayField(fragment, 'expected_user_info') || [];
   const allowedActions = extractJsonStringArrayField(fragment, 'allowed_actions') || [];
   const generalSkillIds = extractJsonStringArrayField(fragment, 'general_skill_ids') || [];
@@ -7218,12 +7400,16 @@ function parseNodeFragment(fragment: string, index: number): Record<string, unkn
     knowledge_scope: {},
     retry_policy: {},
     metadata: {},
+    assignee_user_id: assigneeUserId || null,
+    assignee_notify_channel: assigneeNotifyChannel || null,
   };
 }
 
 function normalizeNodePreview(node: Record<string, unknown>, index = 0): Record<string, unknown> {
   const nodeId = stringValue(node.node_id, `node_${index + 1}`);
   const capabilityRefs = nodeCapabilityRefs(node);
+  const assigneeUserId = stringValue(node.assignee_user_id, '');
+  const assigneeNotifyChannel = stringValue(node.assignee_notify_channel, '');
   return {
     node_id: nodeId,
     type: stringValue(node.type, 'collect_info'),
@@ -7238,6 +7424,8 @@ function normalizeNodePreview(node: Record<string, unknown>, index = 0): Record<
     retry_policy: isRecord(node.retry_policy) ? node.retry_policy : {},
     metadata: isRecord(node.metadata) ? node.metadata : {},
     sub_sop_id: stringValue(node.sub_sop_id, ''),
+    assignee_user_id: assigneeUserId || null,
+    assignee_notify_channel: assigneeNotifyChannel || null,
   };
 }
 
@@ -7436,6 +7624,28 @@ function asStringList(value: unknown): string[] {
   if (Array.isArray(value)) return value.map(String);
   if (typeof value === 'string' && value.trim()) return [value];
   return [];
+}
+
+export function applyNodeTypeChange(
+  node: Record<string, unknown>,
+  nextType: string,
+): Record<string, unknown> {
+  const type = String(nextType || 'collect_info');
+  node.type = type;
+  // 类型切换离开 handoff 时清理转人工专属配置:动作与处理人只属于 handoff 节点
+  if (type !== 'handoff') {
+    node.allowed_actions = asStringList(node.allowed_actions)
+      .filter((action) => action !== 'handoff_human');
+    node.assignee_user_id = null;
+    node.assignee_notify_channel = null;
+  }
+  return node;
+}
+
+export function filterActionOptionsForNodeType(options: SelectOption[], type: string): SelectOption[] {
+  // 转人工动作只允许出现在 handoff 节点上
+  if (String(type || '') === 'handoff') return options;
+  return options.filter((option) => option.value !== 'handoff_human');
 }
 
 function hasSelectedText(): boolean {
@@ -7658,7 +7868,7 @@ function readDistillCache(key: string): DistillCacheSnapshot | null {
       dirtyPaths: Array.isArray(parsed.dirtyPaths) ? parsed.dirtyPaths.map(String) : [],
       textDiffs: Array.isArray(parsed.textDiffs) ? parsed.textDiffs : [],
       pendingChange: parsed.pendingChange || null,
-      viewMode: parsed.viewMode === 'flow' ? 'flow' : 'source',
+      viewMode: parsed.viewMode === 'source' ? 'source' : 'flow',
       attachments: Array.isArray(parsed.attachments)
         ? parsed.attachments.filter((item): item is UploadAttachment => isRecord(item)).map((item) => ({
             id: String(item.id || `file_${Date.now()}_${Math.random().toString(16).slice(2)}`),
@@ -7750,6 +7960,55 @@ function mergePaths(current: string[], next: string[]): string[] {
 
 function cloneSkill(skill: SkillCard): SkillCard {
   return JSON.parse(JSON.stringify(skill)) as SkillCard;
+}
+
+function normalizeSubflowNode<T extends Record<string, unknown>>(node: T): T {
+  if (String(node.type || '') !== 'subflow') return node;
+  return {
+    ...node,
+    instruction: '',
+    expected_user_info: [],
+    allowed_actions: [],
+    capability_refs: {
+      general_skill_ids: [],
+      tool_ids: [],
+      knowledge_base_ids: [],
+      required_general_skill_ids: [],
+      required_tool_ids: [],
+      required_knowledge_base_ids: [],
+    },
+    knowledge_scope: {},
+    retry_policy: {},
+  };
+}
+
+function normalizeSubflowNodes(skill: SkillCard): SkillCard {
+  const next = cloneSkill(skill);
+  next.nodes = (Array.isArray(next.nodes) ? next.nodes : []).map((node) => (
+    normalizeSubflowNode({ ...node })
+  ));
+  return next;
+}
+
+function wouldCreateSopNestingCycle(
+  parentSkillId: string,
+  candidateSkillId: string,
+  skills: SkillRead[],
+): boolean {
+  const byId = new Map(skills.map((item) => [item.skill_id, item]));
+  const visiting = new Set<string>();
+  const reachesParent = (skillId: string): boolean => {
+    if (skillId === parentSkillId) return true;
+    if (visiting.has(skillId)) return false;
+    visiting.add(skillId);
+    const row = byId.get(skillId);
+    const childIds = (row?.content.nodes || [])
+      .filter((node) => String(node.type || '') === 'subflow')
+      .map((node) => String(node.sub_sop_id || '').trim())
+      .filter(Boolean);
+    return childIds.some(reachesParent);
+  };
+  return reachesParent(candidateSkillId);
 }
 
 function canonicalizeSkillCapabilityRefs(skill: SkillCard): SkillCard {
@@ -7907,7 +8166,12 @@ function blankSkillForAnimation(skill: SkillCard): SkillCard {
 }
 
 function diffTargetPaths(previousDraft: SkillCard, nextDraft: SkillCard, targetPaths: string[]): string[] {
-  const candidates = Array.from(new Set([...targetPaths, ...allTargetPaths(previousDraft), ...allTargetPaths(nextDraft)]));
+  const candidates = Array.from(new Set([
+    ...targetPaths,
+    ...allTargetPaths(previousDraft),
+    ...allTargetPaths(nextDraft),
+    'graph',
+  ]));
   return candidates.filter((path) => sectionSignature(previousDraft, path) !== sectionSignature(nextDraft, path));
 }
 
@@ -7926,6 +8190,13 @@ function sectionSignature(skill: SkillCard, path: string): string {
       required_info: skill.required_info || [],
       interruption_policy: skill.interruption_policy || {},
       response_rules: skill.response_rules || [],
+    });
+  }
+  if (path === 'graph') {
+    return JSON.stringify({
+      edges: skill.edges || [],
+      start_node_id: skill.start_node_id,
+      terminal_node_ids: skill.terminal_node_ids || [],
     });
   }
   const stepIndex = stepIndexFromPath(path);
@@ -8274,6 +8545,7 @@ function diffTargetLabel(path: string, skill: SkillCard | null): string {
 function targetLabel(paths: string[], skill: SkillCard): string {
   const labels = paths.map((path) => {
     if (path === 'basic') return '基础信息';
+    if (path === 'graph') return '流程连线';
     const stepIndex = stepIndexFromPath(path);
     if (stepIndex !== null) {
       const index = stepIndex;

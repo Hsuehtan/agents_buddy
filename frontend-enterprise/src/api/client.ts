@@ -80,6 +80,7 @@ export const api = {
     request<T>(path, { method: 'POST', body: JSON.stringify(body), signal }),
   postKeepalive: <T>(path: string, body?: unknown) => keepalivePost<T>(path, body),
   put: <T>(path: string, body: unknown) => request<T>(path, { method: 'PUT', body: JSON.stringify(body) }),
+  patch: <T>(path: string, body: unknown) => request<T>(path, { method: 'PATCH', body: JSON.stringify(body) }),
   delete: <T>(path: string) => request<T>(path, { method: 'DELETE' }),
   blob: async (path: string) => {
     const response = await fetch(`${API_BASE}${path}`, {
@@ -107,6 +108,18 @@ export const api = {
       throw new ApiError(response.status, text, response.statusText);
     }
     return response.blob();
+  },
+  postForm: async <T>(path: string, form: FormData) => {
+    const response = await fetch(`${API_BASE}${path}`, {
+      method: 'POST',
+      headers: { ...authHeader() },
+      body: form,
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      throw new ApiError(response.status, text, response.statusText);
+    }
+    return (await response.json()) as T;
   },
 };
 
@@ -238,6 +251,14 @@ type ParsedApiError = {
   code?: string;
 };
 
+const STABLE_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]+$/;
+
+function stableErrorCode(value: unknown): string | undefined {
+  return typeof value === 'string' && STABLE_ERROR_CODE_PATTERN.test(value)
+    ? value
+    : undefined;
+}
+
 function parseErrorPayload(text: string): ParsedApiError {
   if (!text) return { message: '' };
   try {
@@ -248,8 +269,10 @@ function parseErrorPayload(text: string): ParsedApiError {
       error?: unknown;
     };
     const detail = payload.detail ?? payload.message ?? payload.error;
-    const topLevelCode = typeof payload.code === 'string' ? payload.code : undefined;
-    if (typeof detail === 'string') return { message: detail, code: topLevelCode };
+    const topLevelCode = stableErrorCode(payload.code);
+    if (typeof detail === 'string') {
+      return { message: detail, code: topLevelCode ?? stableErrorCode(detail) };
+    }
     if (Array.isArray(detail)) {
       return {
         message: detail
@@ -266,7 +289,7 @@ function parseErrorPayload(text: string): ParsedApiError {
         : typeof structured.detail === 'string'
           ? structured.detail
           : '';
-      const code = typeof structured.code === 'string' ? structured.code : topLevelCode;
+      const code = stableErrorCode(structured.code) ?? topLevelCode;
       if (message || code) return { message: message || String(code), code };
     }
   } catch {

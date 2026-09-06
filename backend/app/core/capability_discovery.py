@@ -21,8 +21,11 @@ CAPABILITY_SEARCH_MAX_RESULTS = 20
 ALWAYS_EXPANDED_CAPABILITIES = {
     "capability_search",
     "capability_describe",
+    "list_published_deliverables",
+    "read_published_deliverable",
     "exec_command",
     "read_file",
+    "extract_document_text",
     "write_file",
     "edit_file",
     "publish_artifact",

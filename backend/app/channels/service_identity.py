@@ -4,6 +4,7 @@ import hashlib
 import logging
 import re
 import secrets
+from collections.abc import Callable
 
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
@@ -24,7 +25,13 @@ logger = logging.getLogger(__name__)
 _USERNAME_UNSAFE = re.compile(r"[^a-zA-Z0-9_.@-]")
 
 # 渠道显示名前缀(用户回复与懒建账号 display_name 共用)
-_CHANNEL_LABELS = {"wechat": "微信", "wecom": "企业微信", "feishu": "飞书", "dingtalk": "钉钉"}
+_CHANNEL_LABELS = {
+    "wechat": "微信",
+    "wechat_kf": "微信客服",
+    "wecom": "企业微信",
+    "feishu": "飞书",
+    "dingtalk": "钉钉",
+}
 
 
 class IdentityScopeConflict(RuntimeError):
@@ -37,6 +44,12 @@ def channel_label(channel: str) -> str:
 
 def scope_from_config(config: dict, binding: ChannelBinding) -> str:
     """按配置计算生效 scope:wecom 取 corp_id/bot_id,兜底 binding.id;其他渠道置空。"""
+    if binding.channel == "wechat_kf":
+        corp_id = str(config.get("corp_id") or "").strip()
+        open_kfid = str(config.get("open_kfid") or "").strip()
+        if corp_id and open_kfid:
+            return f"{corp_id}:{open_kfid}"
+        return corp_id or binding.id
     if binding.channel != "wecom":
         if binding.channel == "dingtalk":
             return str(config.get("provider_tenant_key") or "").strip() or binding.id
@@ -63,6 +76,15 @@ def external_account_key(channel: str, config: dict) -> str | None:
     if channel == "wechat":
         bot_id = str(config.get("ilink_bot_id") or "").strip()
         return f"wechat:ilink_bot:{bot_id}" if bot_id else None
+    if channel == "wechat_kf":
+        corp_id = str(config.get("corp_id") or "").strip()
+        open_kfid = str(config.get("open_kfid") or "").strip()
+        if corp_id and open_kfid:
+            return (
+                f"wechat_kf:corp:{len(corp_id)}:{corp_id}:"
+                f"kf:{len(open_kfid)}:{open_kfid}"
+            )
+        return f"wechat_kf:corp:{len(corp_id)}:{corp_id}" if corp_id else None
     if channel == "feishu":
         app_id = str(config.get("app_id") or "").strip()
         return f"feishu:app:{len(app_id)}:{app_id}" if app_id else None
@@ -146,6 +168,12 @@ def find_channel_identity(
     ).first()
 
 
+def _is_placeholder_display_name(display_name: str, channel: str) -> bool:
+    """判断 display_name 是否为自动生成的占位名(如 \"飞书用户 5b09042b\")。"""
+    label = channel_label(channel)
+    return display_name.startswith(f"{label}用户 ") or display_name.startswith(f"{label}群聊 ")
+
+
 def resolve_or_provision_user(
     db: Session,
     tenant_id: str,
@@ -153,8 +181,13 @@ def resolve_or_provision_user(
     external_id: str,
     display_name: str | None = None,
     account_scope: str = "",
+    *,
+    name_resolver: Callable[[str], str | None] | None = None,
 ) -> User:
-    """按 (tenant, channel, scope, external_id) 解析 StaffDeck 用户，不存在则开通懒建账号。"""
+    """按 (tenant, channel, scope, external_id) 解析 StaffDeck 用户，不存在则开通懒建账号。
+
+    name_resolver 可选:传入 open_id 返回真实姓名;用于将占位 display_name 替换为渠道真实名。
+    """
     identity = find_channel_identity(db, tenant_id, channel, external_id, account_scope)
     if not identity and external_id.startswith("group:"):
         # 兼容 PR 早期数据:group_{scope}_{chatid} → group:{chatid}
@@ -170,16 +203,35 @@ def resolve_or_provision_user(
     if identity:
         user = db.get(User, identity.staffdeck_user_id)
         if user and user.tenant_id == tenant_id:
+            # 尝试用真实姓名替换占位名
+            if (
+                name_resolver
+                and not external_id.startswith("group:")
+                and _is_placeholder_display_name(user.display_name or "", channel)
+            ):
+                real_name = name_resolver(external_id)
+                if real_name:
+                    user.display_name = real_name
+                    identity.display_name = real_name
+                    db.add(user)
+                    db.add(identity)
+                    db.flush()
             return user
         # 损坏或跨租户 identity 不能继续占据正常 scope 唯一键。
         db.delete(identity)
         db.flush()
 
+    # 尝试获取真实姓名
+    resolved_name = None
+    if name_resolver and not external_id.startswith("group:"):
+        resolved_name = name_resolver(external_id)
+    final_display = (resolved_name or display_name or "").strip() or None
+
     username = channel_username(tenant_id, channel, external_id, account_scope)
     user = User(
         tenant_id=tenant_id,
         username=username,
-        display_name=(display_name or "").strip() or username,
+        display_name=final_display or username,
         role="member",
         source=channel,
         password_hash=hash_password(secrets.token_urlsafe(24)),
@@ -266,6 +318,8 @@ def unbind_external_identity(
         db.add(lazy)
         db.flush()
     identity.staffdeck_user_id = lazy.id
+    # 显示名同步回懒建账号,避免残留原绑定账号名
+    identity.display_name = lazy.display_name or lazy.username
     identity.updated_at = utc_now()
     db.add(identity)
 

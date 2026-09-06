@@ -1,5 +1,5 @@
-from datetime import timedelta
 import threading
+from datetime import timedelta
 
 import pytest
 from sqlalchemy import text as sa_text
@@ -254,9 +254,21 @@ def test_list_users_hides_channel_accounts_by_default() -> None:
     engine = _test_engine()
     with Session(engine) as db:
         db.add(Tenant(id="tenant_demo", name="Demo"))
-        admin = User(id="admin_user", tenant_id="tenant_demo", username="admin", role="admin", password_hash="x")
+        admin = User(
+            id="admin_user",
+            tenant_id="tenant_demo",
+            username="admin",
+            role="admin",
+            password_hash="x",
+        )
         db.add(admin)
-        db.add(User(id="u_web", tenant_id="tenant_demo", username="zhangsan", password_hash="x"))
+        member = User(
+            id="u_web",
+            tenant_id="tenant_demo",
+            username="zhangsan",
+            password_hash="x",
+        )
+        db.add(member)
         db.add(
             User(
                 id="u_lazy",
@@ -264,6 +276,26 @@ def test_list_users_hides_channel_accounts_by_default() -> None:
                 username=channel_username("tenant_demo", "wechat", "user_ab12cd34@im.wechat"),
                 source="wechat",
                 password_hash="x",
+            )
+        )
+        db.add(
+            ChannelIdentity(
+                tenant_id="tenant_demo",
+                channel="feishu",
+                external_account_scope="app_1",
+                external_user_id="ou_member",
+                staffdeck_user_id=member.id,
+                display_name="张三",
+            )
+        )
+        db.add(
+            ChannelIdentity(
+                tenant_id="tenant_demo",
+                channel="feishu",
+                external_account_scope="app_1",
+                external_user_id="group:chat_1",
+                staffdeck_user_id=member.id,
+                display_name="测试群",
             )
         )
         db.commit()
@@ -280,6 +312,15 @@ def test_list_users_hides_channel_accounts_by_default() -> None:
         }
         lazy_row = next(row for row in all_rows if row.id == "u_lazy")
         assert lazy_row.source == "wechat"
+
+        member_rows = list_users(
+            "tenant_demo", include_channel=True, current_user=member, db=db
+        )
+        assert {row.id for row in member_rows} == {"admin_user", "u_web"}
+        member_read = next(row for row in member_rows if row.id == member.id)
+        assert [identity.external_user_id for identity in member_read.channel_identities or []] == [
+            "ou_member"
+        ]
 
 
 # ---------- bind-code 生成 ----------
@@ -523,6 +564,8 @@ def test_bind_success_migrates_history_and_marks_code_used() -> None:
     with Session(engine) as db:
         identity = db.exec(select(ChannelIdentity)).one()
         assert identity.staffdeck_user_id == "user_web"
+        # 显示名同步为码主账号名,不残留懒建期占位名
+        assert identity.display_name == "张三"
         assert db.get(ChatSession, "s_p2p").user_id == "user_web"
         memory = db.get(MemoryRecord, "mem_1")
         assert memory.user_id == "user_web"
@@ -622,6 +665,8 @@ def test_unbind_moves_history_back_to_lazy_account() -> None:
     with Session(engine) as db:
         identity = db.exec(select(ChannelIdentity)).one()
         assert identity.staffdeck_user_id == "user_lazy"
+        # 解绑后显示名同步回懒建账号
+        assert identity.display_name == "微信用户 ab12cd34"
         assert db.get(ChatSession, "s_p2p").user_id == "user_lazy"
         memory = db.get(MemoryRecord, "mem_1")
         assert memory.user_id == "user_lazy"
@@ -1016,6 +1061,7 @@ def test_wecom_unbind_moves_history_back() -> None:
     with Session(engine) as db:
         identity = db.exec(select(ChannelIdentity)).one()
         assert identity.staffdeck_user_id == "user_wecom_lazy"
+        assert identity.display_name == "企微用户 zhangsan"
         assert db.get(ChatSession, "s_wecom_p2p").user_id == "user_wecom_lazy"
         memory = db.get(MemoryRecord, "mem_wecom_1")
         assert memory.user_id == "user_wecom_lazy"
@@ -1274,6 +1320,38 @@ def test_my_identity_bindings_returns_external_account_scope() -> None:
     rows = {row["channel"]: row for row in response.json()}
     assert rows["wechat"]["external_account_scope"] == ""
     assert rows["wecom"]["external_account_scope"] == "corpA"
+
+
+def test_my_identity_bindings_heals_stale_display_name() -> None:
+    """绑定行残留懒建期占位名时,读取接口按当前账号名返回并回写自愈。"""
+    engine = _test_engine()
+    users = _seed_web_users(engine)
+    with Session(engine) as db:
+        db.add(
+            ChannelIdentity(
+                tenant_id="tenant_demo",
+                channel="feishu",
+                external_account_scope="app:20:cli_aaf3d15c5138dbe5:tenant:16:1a0aaaa3801ddcbc",
+                external_user_id="ou_admin",
+                staffdeck_user_id=users["web"].id,
+                display_name="飞书用户 609115",
+            )
+        )
+        db.commit()
+
+    client = _make_api_client(engine)
+    response = client.get(
+        "/api/enterprise/channels/my-identity-bindings?tenant_id=tenant_demo",
+        headers=_auth(users["web"]),
+    )
+    assert response.status_code == 200
+    rows = response.json()
+    assert len(rows) == 1
+    assert rows[0]["display_name"] == "张三"
+
+    with Session(engine) as db:
+        identity = db.exec(select(ChannelIdentity)).one()
+        assert identity.display_name == "张三"
 
 
 def _seed_wecom_bound_identity(engine, user, external_id: str, scope: str) -> None:

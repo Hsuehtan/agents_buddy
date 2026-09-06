@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 import time
+from datetime import timedelta
 
 from sqlalchemy import or_, update
 from sqlalchemy.exc import IntegrityError
@@ -43,10 +44,12 @@ from app.db.models import (
     ChannelIdentity,
     ChannelInboundEvent,
     ChatSession,
+    HumanHandoffRequest,
     MemoryRecord,
     Message,
     Team,
     User,
+    WeChatKfAccount,
     new_id,
     utc_now,
 )
@@ -57,6 +60,8 @@ logger = logging.getLogger(__name__)
 
 ERROR_NOTICE_TEXT = "处理出错，请稍后再试。"
 INTERRUPTED_NOTICE_TEXT = "上一条消息处理中断，请重新发送。"
+# handoff_reply 命令成功时返回此哨兵,跳过通用 _stage_notice(已自行创建 handoff_ack)
+_HANDOFF_REPLY_HANDLED: object = object()
 _DEDUP_LOOKBACK = 50
 _processor_run_pid: int | None = None
 _processor_run_id: str | None = None
@@ -67,6 +72,11 @@ _staged_inbound_wake = threading.Event()
 _binding_intake_condition = threading.Condition()
 _binding_intake_active: dict[str, int] = {}
 _binding_intake_paused: set[str] = set()
+_INBOUND_LEASE_SECONDS = 15 * 60
+
+
+def _inbound_lease_deadline():
+    return utc_now() + timedelta(seconds=_INBOUND_LEASE_SECONDS)
 
 
 def current_processor_run_id() -> str:
@@ -160,8 +170,17 @@ def _claim_stale_event(db: Session, event_id: str) -> bool:
                 ChannelInboundEvent.processor_run_id.is_(None),
                 ChannelInboundEvent.processor_run_id != run_id,
             ),
+            or_(
+                ChannelInboundEvent.processor_run_id.is_(None),
+                ChannelInboundEvent.processor_lease_expires_at.is_(None),
+                ChannelInboundEvent.processor_lease_expires_at <= utc_now(),
+            ),
         )
-        .values(processor_run_id=run_id, updated_at=utc_now())
+        .values(
+            processor_run_id=run_id,
+            processor_lease_expires_at=_inbound_lease_deadline(),
+            updated_at=utc_now(),
+        )
     )
     db.commit()
     return result.rowcount == 1
@@ -175,17 +194,50 @@ def claim_staged_inbound(event_id: str, *, db_engine=None) -> bool:
             update(ChannelInboundEvent)
             .where(
                 ChannelInboundEvent.id == event_id,
-                ChannelInboundEvent.channel.in_({"feishu", "wecom", "dingtalk"}),
+                ChannelInboundEvent.channel.in_({"feishu", "wecom", "dingtalk", "wechat_kf"}),
                 ChannelInboundEvent.status == "received",
             )
             .values(
                 status="processing",
                 processor_run_id=current_processor_run_id(),
+                processor_lease_expires_at=_inbound_lease_deadline(),
                 updated_at=utc_now(),
             )
         )
         db.commit()
         return result.rowcount == 1
+
+
+def _finish_owned_inbound(
+    db: Session,
+    event_id: str,
+    *,
+    status: str,
+    error: str | None = None,
+    processed: bool = False,
+) -> bool:
+    """Finish/release an inbound event only while this process still owns its lease."""
+    values = {
+        "status": status,
+        "error": error,
+        "processor_run_id": None,
+        "processor_lease_expires_at": None,
+        "updated_at": utc_now(),
+    }
+    if processed:
+        values["processed_at"] = utc_now()
+    result = db.exec(
+        update(ChannelInboundEvent)
+        .where(
+            ChannelInboundEvent.id == event_id,
+            ChannelInboundEvent.status == "processing",
+            ChannelInboundEvent.processor_run_id == current_processor_run_id(),
+        )
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
+    return result.rowcount == 1
 
 
 def pause_binding_intake(binding_id: str, timeout_seconds: float = 5.0) -> bool:
@@ -236,7 +288,11 @@ def _release_stale_event_claim(db_engine, event_id: str) -> None:
                 ChannelInboundEvent.status == "processing",
                 ChannelInboundEvent.processor_run_id == run_id,
             )
-            .values(processor_run_id=None, updated_at=utc_now())
+            .values(
+                processor_run_id=None,
+                processor_lease_expires_at=None,
+                updated_at=utc_now(),
+            )
         )
         db.commit()
 
@@ -257,7 +313,11 @@ def _release_stale_event_claim_by_key(
                 ChannelInboundEvent.status == "processing",
                 ChannelInboundEvent.processor_run_id == run_id,
             )
-            .values(processor_run_id=None, updated_at=utc_now())
+            .values(
+                processor_run_id=None,
+                processor_lease_expires_at=None,
+                updated_at=utc_now(),
+            )
         )
         db.commit()
 
@@ -453,9 +513,54 @@ def _stage_notice(
     )
 
 
+_NEGATIVE_NAME_CACHE_TTL = 300  # 5 minutes
+_negative_name_cache: dict[str, float] = {}
+_negative_name_cache_lock = threading.Lock()
+
+
+def _build_name_resolver(binding: ChannelBinding):
+    """返回一个 name_resolver 回调,用于向渠道 API 查询用户真实姓名。
+
+    仅飞书渠道支持;其他渠道返回 None。
+    对查询返回 None 的 open_id 做负缓存(_NEGATIVE_NAME_CACHE_TTL 秒),
+    避免每条消息都同步请求飞书 Contact API。
+    """
+    if binding.channel != "feishu":
+        return None
+
+    def _resolve(open_id: str) -> str | None:
+        now = time.time()
+        with _negative_name_cache_lock:
+            expiry = _negative_name_cache.get(open_id)
+            if expiry and now < expiry:
+                return None
+        try:
+            from app.channels.adapters.feishu import FeishuAdapter
+
+            adapter = FeishuAdapter()
+            name = adapter.get_user_name(binding, open_id)
+            if name:
+                with _negative_name_cache_lock:
+                    _negative_name_cache.pop(open_id, None)
+                return name
+            # 负缓存:TTL 内不再重试
+            with _negative_name_cache_lock:
+                _negative_name_cache[open_id] = now + _NEGATIVE_NAME_CACHE_TTL
+            return None
+        except Exception:
+            logger.debug("feishu get_user_name failed for %s", open_id, exc_info=True)
+            with _negative_name_cache_lock:
+                _negative_name_cache[open_id] = now + _NEGATIVE_NAME_CACHE_TTL
+            return None
+
+    return _resolve
+
+
 def _valid_notice_target(channel: str, target: dict) -> bool:
     if channel == "feishu":
         return bool(target.get("message_id") or target.get("receive_id"))
+    if channel == "wechat_kf":
+        return bool(target.get("to_user_id") and target.get("open_kfid"))
     return bool(target.get("to_user_id") and target.get("context_token"))
 
 
@@ -633,9 +738,11 @@ def _bind_external_identity(
         return "绑定码无效或已过期，请在 StaffDeck 网页端重新生成后再试。"
     _reset_bind_failures(binding.tenant_id, binding.channel, scope, external_id)
 
-    # ① 身份指针改指码主账号(无记录则新建)
+    # ① 身份指针改指码主账号(无记录则新建);显示名同步为码主账号名,
+    # 避免残留懒建期占位名(如"飞书用户 xxx")在绑定列表里显示成另一个身份。
     if identity:
         identity.staffdeck_user_id = owner.id
+        identity.display_name = owner.display_name or owner.username
         identity.updated_at = utc_now()
     else:
         identity = ChannelIdentity(
@@ -644,7 +751,7 @@ def _bind_external_identity(
             external_account_scope=scope,
             external_user_id=external_id,
             staffdeck_user_id=owner.id,
-            display_name=owner.display_name,
+            display_name=owner.display_name or owner.username,
         )
     db.add(identity)
     # ② 历史迁移:原懒建账号名下的渠道会话与全部记忆迁到码主账号
@@ -711,6 +818,362 @@ def _normalize_compat(binding: ChannelBinding, raw: dict) -> ChannelInbound | No
     return adapter.normalize(raw)
 
 
+def _feishu_reply_message_ids(inbound: ChannelInbound) -> list[str]:
+    """Return direct-parent and topic-root ids for reliable handoff matching."""
+    ids: list[str] = []
+    parent_id = str(inbound.parent_id or "").strip()
+    if parent_id:
+        ids.append(parent_id)
+    raw_message = (inbound.raw or {}).get("message")
+    if isinstance(raw_message, dict):
+        root_id = str(raw_message.get("root_id") or "").strip()
+        if root_id and root_id not in ids:
+            ids.append(root_id)
+    return ids
+
+
+def _stage_feishu_assignee_reply(
+    db: Session,
+    binding: ChannelBinding,
+    inbound: ChannelInbound,
+    event: ChannelInboundEvent,
+    session_id: str,
+    text: str,
+) -> None:
+    """给处理人回一条 handoff 流程消息并结束入站事件(经 outbox 投递)。"""
+    db.add(
+        ChannelDelivery(
+            tenant_id=binding.tenant_id,
+            binding_id=binding.id,
+            session_id=session_id,
+            message_id=None,
+            target_json={
+                "receive_id_type": "open_id",
+                "receive_id": inbound.from_user_id,
+            },
+            kind="handoff_ack",
+            text=text,
+            status="pending",
+            next_attempt_at=utc_now(),
+            idempotency_key=new_id("hreplyack"),
+        )
+    )
+    event.status = "done"
+    event.processed_at = utc_now()
+    event.updated_at = utc_now()
+    db.add(event)
+    db.commit()
+
+
+def _try_handle_feishu_handoff_reply(
+    db: Session,
+    binding: ChannelBinding,
+    inbound: ChannelInbound,
+    event: ChannelInboundEvent,
+    target: dict,
+) -> bool:
+    """飞书 handoff 回复分支:处理人引用回复通知消息即完成人工答复,无需指令前缀。
+
+    匹配条件:飞书 p2p 消息引用的 parent_id/root_id 命中本 binding 已投递的
+    handoff_notice/handoff_ack,且发送者 open_id == 投递目标 receive_id(严格校验
+    发送者就是实际通知目标,防止转发/截图场景下的越权回复)。
+    - 引用待处理通知:复用 _apply_handoff_reply 置 answered + 恢复 SOP,并回确认。
+    - 引用已处理的通知/确认消息:回提示并消费该消息,不进入数字员工会话,
+      避免处理人误触发与数字员工的新对话。
+    返回 True 表示已处理(短路 process_inbound);False 表示非 handoff 回复,继续正常流程。
+    """
+    reply_ids = _feishu_reply_message_ids(inbound)
+    if not reply_ids:
+        return False
+    delivery = db.exec(
+        select(ChannelDelivery).where(
+            ChannelDelivery.tenant_id == binding.tenant_id,
+            ChannelDelivery.binding_id == binding.id,
+            ChannelDelivery.kind.in_(("handoff_notice", "handoff_ack")),
+            ChannelDelivery.message_id.in_(reply_ids),
+            ChannelDelivery.status == "delivered",
+        )
+    ).first()
+    if not delivery:
+        return False
+    delivery_target = delivery.target_json or {}
+    delivery_receive_id = str(delivery_target.get("receive_id") or "").strip()
+    if not delivery_receive_id or delivery_receive_id != inbound.from_user_id:
+        return False
+    handoff_id = str(delivery_target.get("handoff_id") or "").strip()
+    if not handoff_id and str(delivery.session_id or "").startswith("handoff:"):
+        handoff_id = str(delivery.session_id).split(":", 1)[1].strip()
+    handoff = db.get(HumanHandoffRequest, handoff_id) if handoff_id else None
+    if not handoff or handoff.tenant_id != binding.tenant_id:
+        return False
+    reply_text = (inbound.text or "").strip()
+    if handoff.status != "pending":
+        # 引用的是已处理/已失效的通知或确认消息:消费并提示,不进入数字员工会话。
+        _stage_feishu_assignee_reply(
+            db,
+            binding,
+            inbound,
+            event,
+            delivery.session_id,
+            "该人工转接请求已处理，无需再次回复。",
+        )
+        logger.info(
+            "飞书 handoff 回复命中已处理 handoff=%s from=%s",
+            handoff.id,
+            inbound.from_user_id,
+        )
+        return True
+    if not reply_text:
+        # 引用通知但无文本(纯图片等):提示用文字答复,不进入数字员工会话。
+        _stage_feishu_assignee_reply(
+            db,
+            binding,
+            inbound,
+            event,
+            delivery.session_id,
+            "请以文字内容回复本条通知消息，作为人工答复。",
+        )
+        return True
+    # assignee 的 StaffDeck 用户 id:从 ChannelIdentity 反查(同 binding scope)。
+    scope = external_account_scope(db, binding)
+    identity = db.exec(
+        select(ChannelIdentity).where(
+            ChannelIdentity.tenant_id == binding.tenant_id,
+            ChannelIdentity.channel == "feishu",
+            ChannelIdentity.external_account_scope == scope,
+            ChannelIdentity.external_user_id == inbound.from_user_id,
+        )
+    ).first()
+    answered_by = identity.staffdeck_user_id if identity else handoff.assignee_user_id
+    from app.api.chat import _apply_handoff_reply
+
+    _apply_handoff_reply(
+        db,
+        handoff,
+        reply_text,
+        answered_by_user_id=answered_by,
+        source="feishu",
+    )
+    # 给处理人回一条确认(经 outbox 投递)
+    _stage_feishu_assignee_reply(
+        db,
+        binding,
+        inbound,
+        event,
+        delivery.session_id,
+        f"已收到你的回复，正在恢复 SOP 执行。回复预览：{reply_text[:120]}",
+    )
+    logger.info(
+        "飞书 handoff 回复命中 handoff=%s assignee=%s",
+        handoff.id,
+        answered_by,
+    )
+    return True
+
+
+def _run_handoff_reply_command(
+    db: Session,
+    binding: ChannelBinding,
+    inbound: ChannelInbound,
+    command: ChannelCommand,
+) -> str:
+    """处理人通过渠道发送 /回复反馈 <内容> 回复人工转接通知。
+
+    匹配策略(按优先级):
+    1. 引用通知(parent_id):按 handoff.notify_message_id == parent_id 精确匹配。
+    2. 非引用:查发送者在当前 binding scope 下的 ChannelIdentity → staffdeck_user_id,
+       再查该 user 名下 status=pending 的 handoff。恰好一个时直接使用;多个时拒绝,
+       提示处理人回复对应通知消息。
+    命中后复用 _apply_handoff_reply 置 answered + 恢复 SOP,并给处理人回确认。
+    无 ChannelIdentity 时拒绝。
+    """
+    reply_text = command.query.strip()
+    if not reply_text:
+        return (
+            "用法：/回复反馈 <答复内容>；企业微信也可使用 /回复反馈 <handoff_id> <答复内容>\n"
+            "回复内容将作为人工答复并恢复 SOP 执行。\n"
+            "也可以直接回复（引用）人工转接通知消息进行答复。"
+        )
+    if "<答复内容>" in reply_text:
+        return (
+            "请把 <答复内容> 替换成实际回复文本，例如："
+            " /回复反馈 handoff_xxx 您好，我来为您处理。"
+        )
+    # 查发送者身份(用当前 binding scope 隔离)
+    scope = external_account_scope(db, binding)
+    identity = db.exec(
+        select(ChannelIdentity).where(
+            ChannelIdentity.tenant_id == binding.tenant_id,
+            ChannelIdentity.channel == binding.channel,
+            ChannelIdentity.external_account_scope == scope,
+            ChannelIdentity.external_user_id == inbound.from_user_id,
+        )
+    ).first()
+    assignee_user_id = identity.staffdeck_user_id if identity else None
+    if not assignee_user_id:
+        return (
+            "未找到待处理的人工转接请求。"
+            "或当前渠道账号未绑定到 StaffDeck 处理人身份。"
+        )
+
+    handoff: HumanHandoffRequest | None = None
+    # 企业微信没有可靠的引用消息 ID。通知中展示 handoff ID，处理人可显式
+    # 指定请求，避免多个 pending 请求时依赖猜测。
+    command_parts = reply_text.split(maxsplit=1)
+    explicit_handoff_id = (
+        command_parts[0].strip()
+        if binding.channel == "wecom" and len(command_parts) == 2
+        else ""
+    )
+    if explicit_handoff_id.startswith("handoff_"):
+        candidate = db.get(HumanHandoffRequest, explicit_handoff_id)
+        if (
+            not candidate
+            or candidate.tenant_id != binding.tenant_id
+            or candidate.status != "pending"
+            or candidate.assignee_user_id != assignee_user_id
+        ):
+            return "未找到分配给你的待处理人工转接请求。请检查 handoff ID。"
+        reply_text = command_parts[1].strip()
+        if not reply_text:
+            return "请在 handoff ID 后提供人工答复内容。"
+        notice = db.exec(
+            select(ChannelDelivery)
+            .where(
+                ChannelDelivery.tenant_id == binding.tenant_id,
+                ChannelDelivery.binding_id == binding.id,
+                ChannelDelivery.kind == "handoff_notice",
+                ChannelDelivery.session_id == f"handoff:{candidate.id}",
+                ChannelDelivery.status == "delivered",
+            )
+            .order_by(ChannelDelivery.created_at.desc())
+        ).first()
+        if not notice or str((notice.target_json or {}).get("to_user_id") or "").strip() != inbound.from_user_id:
+            return "该人工转接请求未投递给你的当前企业微信账号。"
+        handoff = candidate
+    # 策略 1:引用通知 — 按 parent_id -> notify_message_id 精确匹配
+    reply_ids = _feishu_reply_message_ids(inbound)
+    if reply_ids:
+        handoff = db.exec(
+            select(HumanHandoffRequest).where(
+                HumanHandoffRequest.tenant_id == binding.tenant_id,
+                HumanHandoffRequest.notify_message_id.in_(reply_ids),
+                HumanHandoffRequest.status == "pending",
+            )
+        ).first()
+        if not handoff:
+            return "未找到该引用消息对应的待处理人工转接请求。"
+        notice = db.exec(
+            select(ChannelDelivery).where(
+                ChannelDelivery.tenant_id == binding.tenant_id,
+                ChannelDelivery.binding_id == binding.id,
+                ChannelDelivery.kind == "handoff_notice",
+                ChannelDelivery.session_id == f"handoff:{handoff.id}",
+                ChannelDelivery.message_id.in_(reply_ids),
+                ChannelDelivery.status == "delivered",
+            )
+        ).first()
+        notice_target = notice.target_json if notice else {}
+        if (
+            not notice
+            or str(notice_target.get("receive_id") or "").strip()
+            != inbound.from_user_id
+            or handoff.assignee_user_id != assignee_user_id
+        ):
+            # 同时校验通知实际目标与当前 StaffDeck 身份，防止引用或身份变更后越权。
+            return "该人工转接请求不是分配给你的，无法代为回复。"
+
+    # 策略 2:企业微信没有统一的引用消息字段,按当前绑定下最近一次已投递的
+    # handoff 通知匹配。这样处理人可以直接发送 /回复反馈,同时仍限制在自己的
+    # 身份和当前企业账号作用域内。
+    if not handoff and binding.channel == "wecom":
+        notices = db.exec(
+            select(ChannelDelivery)
+            .where(
+                ChannelDelivery.tenant_id == binding.tenant_id,
+                ChannelDelivery.binding_id == binding.id,
+                ChannelDelivery.kind == "handoff_notice",
+                ChannelDelivery.status == "delivered",
+            )
+            .order_by(ChannelDelivery.created_at.desc())
+        ).all()
+        for notice in notices:
+            target = notice.target_json or {}
+            if str(target.get("to_user_id") or "").strip() != inbound.from_user_id:
+                continue
+            handoff_id = str(target.get("handoff_id") or "").strip()
+            candidate = db.get(HumanHandoffRequest, handoff_id) if handoff_id else None
+            if (
+                candidate
+                and candidate.tenant_id == binding.tenant_id
+                and candidate.status == "pending"
+                and candidate.assignee_user_id == assignee_user_id
+            ):
+                handoff = candidate
+                break
+
+    # 策略 3:非引用 — 按 assignee 查 pending handoff。飞书/无可用企微通知
+    # 时保留原有的单请求和多请求保护，避免误回错人工请求。
+    if not handoff:
+        pending = db.exec(
+            select(HumanHandoffRequest).where(
+                HumanHandoffRequest.tenant_id == binding.tenant_id,
+                HumanHandoffRequest.assignee_user_id == assignee_user_id,
+                HumanHandoffRequest.status == "pending",
+            ).order_by(HumanHandoffRequest.created_at.desc())
+        ).all()
+        if not pending:
+            return "未找到待处理的人工转接请求。可能已被处理或已过期。"
+        if len(pending) > 1:
+            return (
+                "你有多个待处理的人工转接请求，请直接回复对应的通知消息"
+                "以指定要回复的请求。"
+            )
+        handoff = pending[0]
+
+    from app.api.chat import _apply_handoff_reply
+
+    answered_by = assignee_user_id or handoff.assignee_user_id
+    _apply_handoff_reply(
+        db,
+        handoff,
+        reply_text,
+        answered_by_user_id=answered_by,
+        source=binding.channel,
+    )
+    # 给处理人回一条确认(经 outbox 投递)。企业微信只接受 to_user_id;
+    # 飞书使用 receive_id + receive_id_type。
+    ack_target = (
+        {"to_user_id": inbound.from_user_id}
+        if binding.channel == "wecom"
+        else {
+            "receive_id_type": "open_id",
+            "receive_id": inbound.from_user_id,
+        }
+    )
+    db.add(
+        ChannelDelivery(
+            tenant_id=binding.tenant_id,
+            binding_id=binding.id,
+            session_id=f"handoff:{handoff.id}",
+            message_id=None,
+            target_json=ack_target,
+            kind="handoff_ack",
+            text=f"已收到你的回复，正在恢复 SOP 执行。回复预览：{reply_text[:120]}",
+            status="pending",
+            next_attempt_at=utc_now(),
+            idempotency_key=new_id("hreplyack"),
+        )
+    )
+    db.commit()
+    logger.info(
+        "/回复反馈 命中 handoff=%s from=%s",
+        handoff.id,
+        inbound.from_user_id,
+    )
+    return _HANDOFF_REPLY_HANDLED
+
+
 def process_inbound(
     binding: ChannelBinding,
     msg: dict | ChannelInbound,
@@ -731,12 +1194,22 @@ def process_inbound(
         return False
     # 作用域以绑定配置为准(适配器侧可能拿的是启动时旧值):统一覆盖后再使用
     scope = external_account_scope(None, binding)
+    if binding.channel == "wechat_kf":
+        corp_id = str((binding.config_json or {}).get("corp_id") or "").strip()
+        scope = f"{corp_id}:{inbound.to_user_id}" if corp_id and inbound.to_user_id else scope
     inbound.account_scope = scope
     command = parse_command(inbound.text)
     target = {
         "to_user_id": inbound.conv_key if inbound.is_group else inbound.from_user_id,
         "context_token": inbound.context_token,
     }
+    if inbound.is_group:
+        target["reply_to_user_id"] = inbound.from_user_id
+        target["is_group"] = True
+        target["reply_quote"] = {
+            "sender_name": inbound.sender_name or inbound.from_user_id,
+            "text": inbound.text,
+        }
 
     with Session(use_engine) as db:
         event = db.get(ChannelInboundEvent, staged_event_pk) if staged_event_pk else None
@@ -749,8 +1222,28 @@ def process_inbound(
                 or event.processor_run_id != current_processor_run_id()
             ):
                 return False
-            target = dict(event.target_json or {})
-        else:
+        if event:
+            target = {
+                **target,
+                **dict(event.target_json or {}),
+            }
+        kf_account = None
+        if binding.channel == "wechat_kf":
+            kf_account = db.exec(
+                select(WeChatKfAccount).where(
+                    WeChatKfAccount.binding_id == binding.id,
+                    WeChatKfAccount.open_kfid == inbound.to_user_id,
+                    WeChatKfAccount.status == "active",
+                )
+            ).first()
+            if not kf_account:
+                event.status = "failed"
+                event.error = "wechat_kf_account_not_bound"
+                event.updated_at = utc_now()
+                db.add(event)
+                db.commit()
+                return False
+        if not event:
             event = ChannelInboundEvent(
                 tenant_id=binding.tenant_id,
                 binding_id=binding.id,
@@ -761,6 +1254,7 @@ def process_inbound(
                 target_json=target,
                 status="processing",
                 processor_run_id=current_processor_run_id(),
+                processor_lease_expires_at=_inbound_lease_deadline(),
             )
             db.add(event)
             try:
@@ -838,25 +1332,41 @@ def process_inbound(
         if command:
             if command.kind in {"bind", "unbind"}:
                 reply = _run_bind_command(db, binding, inbound, command)
+            elif command.kind == "handoff_reply":
+                reply = _run_handoff_reply_command(db, binding, inbound, command)
             elif binding.team_id:
                 # 团队绑定:消息直路由团队 TL,员工列表/切换等指令无意义
                 reply = "该渠道已接入团队，消息由团队 TL 统一接收，员工切换类指令不可用。"
             else:
                 reply = run_command(db, binding, inbound.external_conv_id, command)
-            _stage_notice(
-                db,
-                binding,
-                inbound.external_conv_id,
-                target,
-                reply,
-                final_for_event=True,
-            )
+            # handoff_reply 成功时已自行创建 handoff_ack 投递,跳过通用 notice 避免重复
+            if reply is not _HANDOFF_REPLY_HANDLED:
+                _stage_notice(
+                    db,
+                    binding,
+                    inbound.external_conv_id,
+                    target,
+                    reply,
+                    final_for_event=True,
+                )
             event.status = "done"
             event.processed_at = utc_now()
             event.updated_at = utc_now()
             db.add(event)
             db.commit()
             return False
+
+        # 阶段 4:飞书 handoff 回复分支。处理人用飞书"回复"功能引用通知消息即可
+        # 完成人工答复,无需 /回复反馈 前缀;引用已处理的通知/确认消息时回提示。
+        # 两种情况均短路返回(不走 AgentLoop),不会触发处理人与数字员工的新对话。
+        if (
+            binding.channel == "feishu"
+            and not inbound.is_group
+            and inbound.parent_id
+            and not command
+        ):
+            if _try_handle_feishu_handoff_reply(db, binding, inbound, event, target):
+                return False
 
         external_id, display_name = external_identity_for_message(
             binding.channel,
@@ -866,7 +1376,13 @@ def process_inbound(
             account_scope=scope,
         )
         user = resolve_or_provision_user(
-            db, binding.tenant_id, binding.channel, external_id, display_name, scope
+            db,
+            binding.tenant_id,
+            binding.channel,
+            external_id,
+            display_name,
+            scope,
+            name_resolver=_build_name_resolver(binding),
         )
         # 先在仍保持原 external_conv_id 的历史会话中去重。身份不一致会在后续
         # session 创建时隔离旧会话，若等隔离后再查会漏掉已落库的 turn。
@@ -884,11 +1400,13 @@ def process_inbound(
             return False
         team: Team | None = None
         team_leader_agent_id: str | None = None
-        if binding.team_id:
+        route_team_id = kf_account.team_id if kf_account else binding.team_id
+        route_agent_id = kf_account.agent_id if kf_account else None
+        if route_team_id:
             # 团队绑定:跳过路由指针/自动分发,消息直路由团队现任 TL(换帅自动跟随)
             from app.teams.service import get_team_leader
 
-            team_row = db.get(Team, binding.team_id)
+            team_row = db.get(Team, route_team_id)
             if team_row and team_row.tenant_id == binding.tenant_id and team_row.status == "active":
                 team = team_row
             team_notice: str | None = None
@@ -928,6 +1446,13 @@ def process_inbound(
                 inbound.text,
                 team_id=team.id,
                 team_title=f"团队 {team.name} · TL 对话",
+            )
+        elif route_agent_id:
+            current_agent_id = route_agent_id
+            pointer_reset = False
+            route_decision = None
+            chat_session = find_or_create_channel_session(
+                db, binding, user, current_agent_id, inbound.external_conv_id, inbound.text
             )
         else:
             current_agent_id, pointer_reset = resolve_current_agent(db, binding, inbound.external_conv_id)
@@ -1029,6 +1554,19 @@ def process_inbound(
                 interaction_mode=interaction_mode,
             )
             _send_wechat_typing(binding, inbound.from_user_id, inbound.context_token, 1, db_engine=use_engine)
+            stream_sink = None
+            if binding.channel == "wecom" and isinstance(inbound.raw, dict):
+                adapter = get_channel_adapter(binding.channel)
+                create_stream_reply = getattr(adapter, "create_stream_reply", None)
+                if callable(create_stream_reply):
+                    try:
+                        stream_sink = create_stream_reply(binding, inbound.raw)
+                    except Exception:
+                        logger.exception(
+                            "企微流式回复初始化失败 binding=%s event=%s",
+                            binding.id,
+                            inbound.event_id,
+                        )
             from app.channels.feishu_trace import FeishuTraceStreamer, is_feishu_trace_enabled
 
             trace_streamer: FeishuTraceStreamer | None = None
@@ -1055,24 +1593,42 @@ def process_inbound(
                     db.commit()
 
                 with bind_span_sink(persist_span):
-                    response = AgentLoop(
-                        db, event_sink=trace_streamer.on_event if trace_streamer else None
-                    ).handle_turn(request)
+                    event_sink = trace_streamer.on_event if trace_streamer else None
+                    if stream_sink is not None:
+                        original_event_sink = event_sink
+
+                        def event_sink(event_type: str, payload: dict[str, object]) -> None:
+                            stream_sink.on_event(event_type, payload)
+                            if original_event_sink:
+                                original_event_sink(event_type, payload)
+
+                    agent_loop_kwargs = {
+                        "event_sink": event_sink,
+                    }
+                    if stream_sink is not None:
+                        agent_loop_kwargs["stream_sink"] = stream_sink
+                    response = AgentLoop(db, **agent_loop_kwargs).handle_turn(request)
             except Exception as exc:
                 logger.exception("渠道入站处理失败 binding=%s event=%s", binding.id, inbound.event_id)
                 if trace_streamer:
                     trace_streamer.abort(str(exc)[:200])
+                if stream_sink is not None:
+                    abort_stream = getattr(stream_sink, "abort", None)
+                    if callable(abort_stream):
+                        abort_stream()
                 db.rollback()
                 event = db.get(ChannelInboundEvent, event_id)
                 chat_session = db.get(ChatSession, session_id)
                 if not event or not chat_session:
                     return False
-                event.status = "failed"
-                event.error = str(exc)[:500]
-                event.updated_at = utc_now()
-                db.add(event)
-                _stage_error_notice(db, binding, chat_session)
-                db.commit()
+                if _finish_owned_inbound(
+                    db,
+                    event_id,
+                    status="failed",
+                    error=str(exc)[:500],
+                ):
+                    _stage_error_notice(db, binding, chat_session)
+                    db.commit()
                 return False
             else:
                 if trace_streamer:
@@ -1100,27 +1656,32 @@ def process_inbound(
                 # channel turn. Persist an explicit terminal notice for this
                 # delivery (which also removes the processing reaction), then
                 # release the inbox row for a later retry.
-                event.status = "received"
-                event.processor_run_id = None
-                event.error = response_reply[:500]
-                event.updated_at = utc_now()
-                db.add(event)
-                _stage_notice(
+                if _finish_owned_inbound(
                     db,
-                    binding,
-                    str(inbound.external_conv_id or ""),
-                    dict(event.target_json or {}),
-                    response_reply,
-                    final_for_event=True,
-                    idempotency_key=f"channel-runtime-conflict:{binding.id}:{event.event_id}",
-                )
-                db.commit()
+                    event_id,
+                    status="received",
+                    error=response_reply[:500],
+                ):
+                    _stage_notice(
+                        db,
+                        binding,
+                        str(inbound.external_conv_id or ""),
+                        dict(event.target_json or {}),
+                        response_reply,
+                        final_for_event=True,
+                        idempotency_key=(
+                            f"channel-runtime-conflict:{binding.id}:{event.event_id}"
+                        ),
+                    )
+                    db.commit()
                 return False
-            event.status = "done"
-            event.processed_at = utc_now()
-            event.updated_at = utc_now()
-            db.add(event)
-            db.commit()
+            if not _finish_owned_inbound(
+                db,
+                event_id,
+                status="done",
+                processed=True,
+            ):
+                return False
             if team is not None:
                 # TL 回复后处理:解析派任务块并创建任务(与主聊天端同语义);
                 # 后处理失败不影响本轮回复
@@ -1161,13 +1722,14 @@ def process_staged_inbound(event_pk: str, *, db_engine=None) -> bool:
                 update(ChannelInboundEvent)
                 .where(
                     ChannelInboundEvent.id == event_pk,
-                    ChannelInboundEvent.channel.in_({"feishu", "wecom", "dingtalk"}),
+                    ChannelInboundEvent.channel.in_({"feishu", "wecom", "dingtalk", "wechat_kf"}),
                     ChannelInboundEvent.status == "processing",
                     ChannelInboundEvent.processor_run_id == current_processor_run_id(),
                 )
                 .values(
                     status="received",
                     processor_run_id=None,
+                    processor_lease_expires_at=None,
                     updated_at=utc_now(),
                 )
             )
@@ -1257,7 +1819,9 @@ def run_staged_inbound_daemon(
                 event_ids = db.exec(
                     select(ChannelInboundEvent.id)
                     .where(
-                        ChannelInboundEvent.channel.in_({"feishu", "wecom", "dingtalk"}),
+                        ChannelInboundEvent.channel.in_(
+                            {"feishu", "wecom", "dingtalk", "wechat_kf"}
+                        ),
                         ChannelInboundEvent.status == "received",
                     )
                     .order_by(ChannelInboundEvent.created_at)
@@ -1355,66 +1919,70 @@ def _decode_and_validate_staged_event(
         ):
             raise ValueError("replay_account_mismatch")
         return inbound
+    if event.channel == "wechat_kf":
+        from app.channels.service_wechat_kf_inbox import decode_replay_envelope
+
+        inbound = decode_replay_envelope(payload)
+        scope = str((account or {}).get("scope") or "").strip()
+        expected_scope = external_account_scope(None, binding)
+        if binding.channel == "wechat_kf":
+            corp_id = str((binding.config_json or {}).get("corp_id") or "").strip()
+            open_kfid = str(inbound.to_user_id or "").strip()
+            expected_scope = f"{corp_id}:{open_kfid}" if corp_id and open_kfid else expected_scope
+        if not scope or expected_scope != scope:
+            raise ValueError("replay_account_mismatch")
+        return inbound
     raise ValueError("unsupported_envelope_channel")
 
 
 def _recover_stale_durable_event(event_pk: str, *, db_engine=None) -> bool:
     use_engine = db_engine or engine
-    run_id = current_processor_run_id()
     with Session(use_engine) as db:
         event = db.get(ChannelInboundEvent, event_pk)
         binding = db.get(ChannelBinding, event.binding_id) if event else None
         if not event or not binding or event.status != "processing":
             return False
+        if not _claim_stale_event(db, event_pk):
+            return False
+        event = db.get(ChannelInboundEvent, event_pk)
         try:
             inbound = _decode_and_validate_staged_event(event, binding)
         except ValueError as exc:
-            event.status = "failed"
-            event.error = str(exc)[:500]
-            event.updated_at = utc_now()
-            db.add(event)
-            db.commit()
+            _finish_owned_inbound(
+                db,
+                event_pk,
+                status="failed",
+                error=str(exc)[:500],
+            )
             return False
         turn_message = _find_turn_user_message_in_conv(
             db, binding, inbound.external_conv_id, inbound.event_id
         )
         if turn_message:
-            if not _claim_stale_event(db, event_pk):
-                return False
-            event = db.get(ChannelInboundEvent, event_pk)
             if _turn_reply_exists(db, binding, turn_message):
-                event.status = "done"
-                event.error = None
-                event.processed_at = utc_now()
-            else:
-                event.status = "failed"
-                event.error = "process_exit_incomplete_turn"
-                _stage_interrupted_notice(
+                _finish_owned_inbound(
                     db,
-                    binding,
-                    turn_message.session_id,
-                    dict(event.target_json or {}),
-                    inbound.event_id,
+                    event_pk,
+                    status="done",
+                    processed=True,
                 )
-            event.updated_at = utc_now()
-            db.add(event)
-            db.commit()
+            else:
+                if _finish_owned_inbound(
+                    db,
+                    event_pk,
+                    status="failed",
+                    error="process_exit_incomplete_turn",
+                ):
+                    _stage_interrupted_notice(
+                        db,
+                        binding,
+                        turn_message.session_id,
+                        dict(event.target_json or {}),
+                        inbound.event_id,
+                    )
+                    db.commit()
             return False
-        released = db.exec(
-            update(ChannelInboundEvent)
-            .where(
-                ChannelInboundEvent.id == event_pk,
-                ChannelInboundEvent.channel.in_({"feishu", "wecom", "dingtalk"}),
-                ChannelInboundEvent.status == "processing",
-                or_(
-                    ChannelInboundEvent.processor_run_id.is_(None),
-                    ChannelInboundEvent.processor_run_id != run_id,
-                ),
-            )
-            .values(status="received", processor_run_id=None, updated_at=utc_now())
-        )
-        db.commit()
-        if released.rowcount != 1:
+        if not _finish_owned_inbound(db, event_pk, status="received"):
             return False
     return process_staged_inbound(event_pk, db_engine=use_engine)
 
@@ -1435,6 +2003,11 @@ def sweep_stale_inbound_events(*, db_engine=None) -> int:
                     ChannelInboundEvent.processor_run_id.is_(None),
                     ChannelInboundEvent.processor_run_id != run_id,
                 ),
+                or_(
+                    ChannelInboundEvent.processor_run_id.is_(None),
+                    ChannelInboundEvent.processor_lease_expires_at.is_(None),
+                    ChannelInboundEvent.processor_lease_expires_at <= utc_now(),
+                ),
             )
         ).all()
         candidates = [
@@ -1446,11 +2019,14 @@ def sweep_stale_inbound_events(*, db_engine=None) -> int:
             binding = db.get(ChannelBinding, binding_id)
             if not binding:
                 continue
-            if channel not in {"feishu", "wecom", "dingtalk"} and binding.status != "active":
+            if (
+                channel not in {"feishu", "wecom", "dingtalk", "wechat_kf"}
+                and binding.status != "active"
+            ):
                 continue
             db.expunge(binding)
         try:
-            if channel in {"feishu", "wecom", "dingtalk"}:
+            if channel in {"feishu", "wecom", "dingtalk", "wechat_kf"}:
                 if _recover_stale_durable_event(event_pk, db_engine=use_engine):
                     taken += 1
                 continue

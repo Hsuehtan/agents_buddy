@@ -112,6 +112,7 @@ import {
   sameRoleTurn,
   scheduledDraftForMessage,
   sessionFilterStorageKey,
+  shouldDeferPersistedEventToLiveStream,
   shouldKeepRealtimeMessage,
   stepResultTraceLine,
   streamErrorTraceLine,
@@ -384,6 +385,14 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     show_tool_trace: true,
     reflection_max_rounds: 1,
     agent_loop_max_actions: 32,
+    context_token_budget: 32_000,
+    context_compaction_trigger_ratio: 0.7,
+    context_recent_round_limit: 6,
+    context_long_summary_token_budget: 4_000,
+    context_medium_summary_token_budget: 4_000,
+    context_allowed_roles: ['user', 'assistant'],
+    context_long_summary_prefix: '历史的信息可以被总结为：',
+    context_medium_summary_prefix: '近期的历史信息总结为：',
     sandbox_enabled: false,
     harness_storage_path: '',
     effective_harness_storage_path: '',
@@ -1294,6 +1303,7 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
             outputLanguage: line.outputLanguage || undefined,
             outputTitle: line.outputTitle || undefined,
             state: line.state,
+            depth: typeof line.depth === 'number' ? line.depth : undefined,
             collapsible: Boolean(line.collapsible || line.code || line.output),
           }));
           let mergedTrace = mergeTurnTraceSnapshot(turnTraceRef.current.get(row.turn_id), {
@@ -1765,13 +1775,25 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
   useEffect(() => {
     if (!sessionId || runningTurn?.sessionId !== sessionId) return;
     const timer = window.setInterval(() => {
-      if (getStreamSlot(sessionId).abortController) return;
       void loadMessages(sessionId).finally(() => {
         void loadTraces(sessionId);
       });
     }, 1500);
     return () => window.clearInterval(timer);
-  }, [getStreamSlot, loadMessages, loadTraces, runningTurn?.sessionId, sessionId]);
+  }, [loadMessages, loadTraces, runningTurn?.sessionId, sessionId]);
+
+  // A TL turn ends as soon as the team DAG is dispatched. The eventual synthesis is
+  // persisted asynchronously, outside that turn's SSE stream, so keep the active team
+  // conversation synchronized even while there is no locally running turn.
+  useEffect(() => {
+    if (!sessionId || !displayedTeamId || runningTurn?.sessionId === sessionId) return;
+    const timer = window.setInterval(() => {
+      void loadMessages(sessionId).finally(() => {
+        void loadTraces(sessionId);
+      });
+    }, 2_000);
+    return () => window.clearInterval(timer);
+  }, [displayedTeamId, loadMessages, loadTraces, runningTurn?.sessionId, sessionId]);
 
   useEffect(() => {
     if (!sessionId) return;
@@ -2699,9 +2721,9 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
           const eventTurnId = eventTraceTurnId(event);
           if (!eventTurnId) return;
           const liveSseOwnsTurn = Boolean(stream.abortController && stream.turnId === eventTurnId);
-          if (liveSseOwnsTurn) return;
-          scheduledEventIdsRef.current.add(event.id);
           const terminalEvent = isTerminalSessionEvent(event, isTerminalEvent);
+          if (shouldDeferPersistedEventToLiveStream(event.event, liveSseOwnsTurn)) return;
+          scheduledEventIdsRef.current.add(event.id);
           const hasFinalAssistant = hasAssistantMessageForTurn(slot, eventTurnId);
           if (event.event === 'assistant_message_created') {
             if (!hasFinalAssistant) {

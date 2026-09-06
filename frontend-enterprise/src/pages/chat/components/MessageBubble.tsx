@@ -21,12 +21,6 @@ import {
   CHAT_ATTACHMENT_LIST_CLASS,
   CHAT_ATTACHMENT_META_CLASS,
   CHAT_ATTACHMENT_NAME_CLASS,
-  CHAT_CITATION_CHIP_CLASS,
-  CHAT_CITATION_HEADING_CLASS,
-  CHAT_CITATION_INDEX_CLASS,
-  CHAT_CITATION_LIST_CLASS,
-  CHAT_CITATION_TITLE_CLASS,
-  CHAT_CITATIONS_CLASS,
   CHAT_FEEDBACK_BTN_ACTIVE_CLASS,
   CHAT_FEEDBACK_BTN_CLASS,
   CHAT_FEEDBACK_BTN_DISLIKE_ACTIVE_CLASS,
@@ -53,12 +47,12 @@ import {
   MarkdownMessage,
   attachmentTypeLabel,
   canRateMessage,
-  citationDisplayTitle,
 } from '../chatHelpers';
 import type { TraceLine } from '../chatTypes';
 import type { UseChatSession } from '../useChatSession';
 import ExecutionRecord from './ExecutionRecord';
 import HarnessArtifactDownloads from './HarnessArtifactDownloads';
+import KnowledgeCitationList from './KnowledgeCitationList';
 import ScheduledDraftCard from './ScheduledDraftCard';
 import SlashCommandChip from './SlashCommandChip';
 import { slashCommandMessage } from '../slashCommands';
@@ -84,6 +78,18 @@ type MessageBubbleProps = {
   item: ChatMessage;
   render: MessageRender;
 };
+
+function activeTeamProgress(item: ChatMessage): { phase: string; statusText: string } | null {
+  const progress = item.metadata?.team_progress;
+  if (!progress || typeof progress !== 'object' || Array.isArray(progress)) return null;
+  const progressRecord = progress as Record<string, unknown>;
+  const phase = typeof progressRecord.phase === 'string' ? progressRecord.phase : '';
+  if (phase !== 'collecting' && phase !== 'synthesizing') return null;
+  const statusText = typeof progressRecord.status_text === 'string'
+    ? progressRecord.status_text.trim()
+    : '';
+  return statusText ? { phase, statusText } : null;
+}
 
 export default function MessageBubble({ chat, item, render }: MessageBubbleProps) {
   const {
@@ -117,6 +123,7 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
   const groupSenderName = chat.displayedAgent
     ? employeeDisplayName(chat.displayedAgent)
     : '项目领导';
+  const teamProgress = item.role === 'assistant' ? activeTeamProgress(item) : null;
 
   return (
     <div className={cn(CHAT_MESSAGE_ITEM_CLASS, queuedMessage && CHAT_QUEUED_MESSAGE_ITEM_CLASS)}>
@@ -167,8 +174,21 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
 
           {!statusOnly && visibleContent ? (
             item.role === 'assistant' ? (
-              <div data-i18n-ignore>
+              <div aria-live={teamProgress ? 'polite' : undefined} data-i18n-ignore>
                 <MarkdownMessage content={visibleContent} />
+                {teamProgress && (
+                  <div
+                    role="status"
+                    aria-label={teamProgress.statusText}
+                    className="mt-[8px] flex items-center gap-[7px] text-[12px] text-[#6d7791]"
+                  >
+                    <span className="relative flex size-[7px]">
+                      <span className="absolute inline-flex size-full animate-ping rounded-full bg-[#1a71ff] opacity-40" />
+                      <span className="relative inline-flex size-[7px] rounded-full bg-[#1a71ff]" />
+                    </span>
+                    <span>{teamProgress.statusText}</span>
+                  </div>
+                )}
               </div>
             ) : (
               <div className={cn(
@@ -229,26 +249,8 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
             />
           )}
 
-          {item.role === 'assistant' && citations.length > 0 && (
-            <div className={CHAT_CITATIONS_CLASS} aria-label="知识引用">
-              <div className={CHAT_CITATION_HEADING_CLASS}>
-                <StaffdeckIcon name="file" size={14} />
-                <span>知识来源</span>
-              </div>
-              <div className={CHAT_CITATION_LIST_CLASS}>
-                {citations.map((citation) => (
-                  <button
-                    key={citation.id}
-                    type="button"
-                    className={CHAT_CITATION_CHIP_CLASS}
-                    onClick={() => setActiveCitation(citation)}
-                  >
-                    <span className={CHAT_CITATION_INDEX_CLASS} data-i18n-ignore>{citation.label || citation.id}</span>
-                    <span className={CHAT_CITATION_TITLE_CLASS} data-i18n-ignore>{citationDisplayTitle(citation)}</span>
-                  </button>
-                ))}
-              </div>
-            </div>
+          {item.role === 'assistant' && (
+            <KnowledgeCitationList citations={citations} onOpen={setActiveCitation} />
           )}
 
           {scheduledDraft && (
@@ -260,7 +262,7 @@ export default function MessageBubble({ chat, item, render }: MessageBubbleProps
             />
           )}
 
-          {canRateMessage(item) && (
+          {canRateMessage(item) && !teamProgress && (
             <div className={CHAT_FEEDBACK_CLASS}>
               <button
                 type="button"

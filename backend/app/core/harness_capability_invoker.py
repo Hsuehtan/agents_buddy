@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import mimetypes
+import re
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -27,6 +29,11 @@ from app.core.capability_manifest import (
     tool_snapshot_digest,
 )
 from app.core.harness_agent import HarnessExecutionCancelled
+from app.core.published_deliverables import (
+    MAX_PUBLISHED_DELIVERABLES,
+    find_published_deliverable,
+    list_published_deliverables,
+)
 from app.core.harness_session_cleanup import harness_task_workspace_path
 from app.core.task_request_compiler import CapabilityDescriptor, CapabilityManifest
 from app.core.tool_replay_policy import ToolReplayPolicy
@@ -50,6 +57,7 @@ from app.harness import (
     open_harness_artifact,
     publish_changed_harness_artifacts,
     register_command_tools,
+    register_skill_script_tools,
     snapshot_harness_workspace,
 )
 from app.harness.execution_context import SANDBOX_WORKSPACE
@@ -64,6 +72,7 @@ from app.tools.tool_schema import ToolCall
 
 _INLINE_JSON_TOOL_RESULT_MAX_CHARS = 2_000
 _INTERNAL_TOOL_RESULT_DIRECTORY = ".harness/tool-results"
+_GENERAL_SKILL_PACKAGE_DIRECTORY = ".harness/skill-packages"
 _SANDBOX_JSON_FILE_KIND = "sandbox_json_file"
 
 
@@ -123,6 +132,7 @@ class HarnessCapabilityInvoker:
         )
         self._file_registry = build_file_tool_registry()
         register_command_tools(self._file_registry)
+        register_skill_script_tools(self._file_registry)
         self._file_executor = HarnessExecutor(self._file_registry)
         self._file_context = HarnessToolContext(
             run_id=self.run_id,
@@ -412,6 +422,28 @@ class HarnessCapabilityInvoker:
         )
         if result.success:
             data = dict(result.data or {})
+            if name in {"exec_command", "run_skill_script"} and data.get("ok") is not True:
+                visible_data = _model_visible_file_result(data)
+                timed_out = bool(data.get("timed_out"))
+                return {
+                    "success": False,
+                    "data": visible_data,
+                    "error": {
+                        "code": (
+                            "COMMAND_TIMEOUT"
+                            if timed_out
+                            else "COMMAND_EXIT_NONZERO"
+                        ),
+                        "message": (
+                            "受控进程执行超时。"
+                            if timed_out
+                            else "受控进程执行完成，但返回了非零退出码。"
+                        ),
+                        "retryable": False,
+                        "details": visible_data,
+                    },
+                    "duration_ms": result.duration_ms,
+                }
             artifacts: list[dict[str, Any]] = []
             if name == "publish_artifact":
                 artifact_path = str(data.get("path") or "").strip()
@@ -467,10 +499,133 @@ class HarnessCapabilityInvoker:
             return self._search_capabilities(arguments)
         if name == "capability_describe":
             return self._describe_capabilities(arguments)
+        if name == "list_published_deliverables":
+            return self._list_published_deliverables(arguments)
+        if name == "read_published_deliverable":
+            return self._read_published_deliverable(arguments)
         return _failure(
             "UNSUPPORTED_INTERNAL_CAPABILITY",
             "不支持的 Harness 内部能力。",
         )
+
+    def _list_published_deliverables(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        raw_limit = arguments.get("limit", MAX_PUBLISHED_DELIVERABLES)
+        if isinstance(raw_limit, bool) or not isinstance(raw_limit, int):
+            return _failure("INVALID_ARGUMENTS", "limit 必须是整数。")
+        rows = list_published_deliverables(
+            self.db,
+            tenant_id=self.tenant_id,
+            session_id=self.session.id,
+            query=str(arguments.get("query") or ""),
+            limit=raw_limit,
+            exclude_task_frame_id=self.task_frame_id,
+        )
+        return {
+            "success": True,
+            "data": {
+                "deliverables": rows,
+                "count": len(rows),
+                "notice": (
+                    "使用 read_published_deliverable 读取所需文件，"
+                    "不要用 read_file 猜测旧工作区路径。"
+                ),
+            },
+        }
+
+    def _read_published_deliverable(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        task_frame_id = str(arguments.get("task_frame_id") or "").strip()
+        path = str(arguments.get("path") or "").strip()
+        if not task_frame_id or not path:
+            return _failure("INVALID_ARGUMENTS", "task_frame_id 和 path 不能为空。")
+        artifact = find_published_deliverable(
+            self.db,
+            tenant_id=self.tenant_id,
+            session_id=self.session.id,
+            task_frame_id=task_frame_id,
+            path=path,
+        )
+        if artifact is None:
+            return _failure(
+                "PUBLISHED_DELIVERABLE_NOT_FOUND",
+                "当前会话中没有该历史交付物。",
+            )
+        workspace_root = _workspace_root(
+            self.tenant_id,
+            self.session.id,
+            task_frame_id,
+            db=self.db,
+        )
+        opened = None
+        try:
+            opened = open_harness_artifact(workspace_root, path)
+            actual_sha256 = opened.sha256()
+            expected_sha256 = str(artifact.get("sha256") or "").strip().lower()
+            expected_size = artifact.get("size")
+            if (
+                (expected_sha256 and expected_sha256 != actual_sha256.lower())
+                or (isinstance(expected_size, int) and expected_size != opened.size)
+            ):
+                return _failure(
+                    "PUBLISHED_DELIVERABLE_CHANGED",
+                    "历史交付物在发布后已发生变化，拒绝读取。",
+                )
+        except (HarnessArtifactAccessError, OSError):
+            return _failure(
+                "PUBLISHED_DELIVERABLE_NOT_FOUND",
+                "历史交付物不存在或无法安全读取。",
+            )
+        finally:
+            if opened is not None:
+                opened.close()
+
+        read_arguments = {
+            key: arguments[key]
+            for key in ("path", "offset", "max_bytes", "continuation_token")
+            if key in arguments
+        }
+        read_context = HarnessToolContext(
+            run_id=self.run_id,
+            task_frame_id=task_frame_id,
+            tenant_id=self.tenant_id,
+            workspace_root=workspace_root,
+            limits=self._file_context.limits,
+            sandbox_enabled=self._file_context.sandbox_enabled,
+            sandbox_network_mode=self._file_context.sandbox_network_mode,
+            sandbox_allowed_domains=self._file_context.sandbox_allowed_domains,
+        )
+        result = self._file_executor.execute(
+            read_context,
+            HarnessToolCall(
+                call_id=new_id("hcall"),
+                name="read_file",
+                arguments=read_arguments,
+            ),
+        )
+        if not result.success:
+            return {
+                "success": False,
+                "error": {
+                    "code": (
+                        result.error.code
+                        if result.error
+                        else "PUBLISHED_DELIVERABLE_READ_FAILED"
+                    ),
+                    "message": (
+                        result.error.message if result.error else "历史交付物读取失败。"
+                    ),
+                    "retryable": bool(result.error.retryable) if result.error else False,
+                    "details": dict(result.error.details) if result.error else {},
+                },
+            }
+        data = dict(result.data or {})
+        data.update(
+            {
+                "task_frame_id": task_frame_id,
+                "display_name": artifact.get("display_name"),
+                "published_at": artifact.get("published_at"),
+            }
+        )
+        return {"success": True, "data": data}
 
     def _search_capabilities(self, arguments: dict[str, Any]) -> dict[str, Any]:
         query = str(arguments.get("query") or "").strip()
@@ -711,6 +866,19 @@ class HarnessCapabilityInvoker:
         metadata: dict[str, Any],
         query: str,
     ) -> dict[str, Any]:
+        package = package_from_row(skill)
+        package_root, file_paths = _materialize_general_skill_package(
+            self.workspace_root,
+            package,
+        )
+        entrypoint_path = next(
+            (
+                item
+                for item in file_paths
+                if item.removeprefix(package_root + "/") == package.entrypoint
+            ),
+            f"{package_root}/{package.entrypoint}",
+        )
         return {
             "success": True,
             "data": {
@@ -719,8 +887,15 @@ class HarnessCapabilityInvoker:
                 "operation": "read",
                 "query": query,
                 "package": _skill_package_preview(skill),
+                "package_root": package_root,
+                "sandbox_package_root": _sandbox_path(package_root),
+                "entrypoint_path": entrypoint_path,
+                "sandbox_entrypoint_path": _sandbox_path(entrypoint_path),
+                "file_paths": file_paths,
                 "notice": (
                     "技能包说明已加载到当前隔离 Harness transcript；"
+                    "包内文件已物化到 package_root，请只使用返回的 entrypoint_path 和"
+                    " file_paths 定位文件；"
                     "请由 AgentLoop 直接应用其中的 prompt、规则和示例，并按任务需要调用"
                     "知识库、原装 Tool、exec_command 或 typed 文件工具；Skill 本身不会"
                     "生成临时代码或启动第二套 runner。"
@@ -842,6 +1017,7 @@ class HarnessCapabilityInvoker:
             active_skill_id=self.active_skill_id,
             agent_id=self.agent_id,
             session_id=self.session.id,
+            invocation_id=call_id,
             timeout_seconds_override=self._remaining_step_seconds(),
         )
         payload = result.model_dump(mode="json")
@@ -852,6 +1028,9 @@ class HarnessCapabilityInvoker:
         payload.pop("mcp_metadata", None)
         if payload.get("success") is not True:
             return payload
+        a2a_artifacts = self._materialize_a2a_artifacts(payload, call_id=call_id)
+        if a2a_artifacts:
+            payload["artifacts"] = [*(payload.get("artifacts") or []), *a2a_artifacts]
         payload = self._persist_large_json_result(payload, call_id=call_id)
         if isinstance(app_descriptor, dict) and payload.get("success") is True:
             app_descriptor["initial_result"] = payload.get("data")
@@ -863,6 +1042,68 @@ class HarnessCapabilityInvoker:
                 },
             )
         return payload
+
+    def _materialize_a2a_artifacts(
+        self,
+        payload: dict[str, Any],
+        *,
+        call_id: str,
+    ) -> list[dict[str, Any]]:
+        data = payload.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("artifacts"), list):
+            return []
+        published: list[dict[str, Any]] = []
+        directory = self.workspace_root / "artifacts" / "a2a" / _safe_artifact_name(call_id)
+        for artifact_index, artifact in enumerate(data["artifacts"], start=1):
+            if not isinstance(artifact, dict):
+                continue
+            for part_index, part in enumerate(artifact.get("parts") or [], start=1):
+                if not isinstance(part, dict) or not isinstance(part.get("file"), dict):
+                    continue
+                file_part = part["file"]
+                encoded = file_part.get("bytes")
+                if not isinstance(encoded, str) or not encoded:
+                    continue
+                try:
+                    content = base64.b64decode(encoded, validate=True)
+                except ValueError:
+                    continue
+                requested_name = str(file_part.get("name") or "").strip()
+                filename = _safe_artifact_name(
+                    requested_name or f"artifact-{artifact_index}-{part_index}.bin"
+                )
+                directory.mkdir(parents=True, exist_ok=True)
+                output = directory / filename
+                suffix = 2
+                while output.exists():
+                    output = directory / f"{Path(filename).stem}-{suffix}{Path(filename).suffix}"
+                    suffix += 1
+                output.write_bytes(content)
+                relative = output.relative_to(self.workspace_root).as_posix()
+                sha256 = hashlib.sha256(content).hexdigest()
+                content_type = str(file_part.get("mimeType") or "").strip() or (
+                    mimetypes.guess_type(filename)[0] or "application/octet-stream"
+                )
+                file_part.pop("bytes", None)
+                file_part["path"] = relative
+                file_part["sandbox_path"] = _sandbox_path(relative)
+                file_part["sha256"] = sha256
+                published.append(
+                    {
+                        "type": "workspace_file",
+                        "task_frame_id": self.task_frame_id,
+                        "path": relative,
+                        "sandbox_path": _sandbox_path(relative),
+                        "sha256": sha256,
+                        "size": len(content),
+                        "display_name": requested_name or filename,
+                        "description": str(artifact.get("description") or "A2A Artifact"),
+                        "content_type": content_type,
+                        "operation": "a2a_artifact",
+                        "source": "a2a",
+                    }
+                )
+        return published
 
     def _persist_large_json_result(
         self,
@@ -1150,6 +1391,72 @@ def _skill_package_preview(
     }
 
 
+def _materialize_general_skill_package(
+    workspace_root: Path,
+    package: Any,
+) -> tuple[str, list[str]]:
+    """Write an immutable GeneralSkill snapshot into the current TaskFrame workspace."""
+
+    safe_slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(package.slug or "skill")).strip(
+        ".-"
+    ) or "skill"
+    digest_suffix = re.sub(r"[^a-fA-F0-9]", "", str(package.digest or ""))[:12]
+    directory_name = safe_slug + (f"-{digest_suffix}" if digest_suffix else "")
+    relative_root = f"{_GENERAL_SKILL_PACKAGE_DIRECTORY}/{directory_name}"
+    target_root = workspace_root / relative_root
+    workspace_resolved = workspace_root.resolve()
+    target_resolved = target_root.resolve(strict=False)
+    if not target_resolved.is_relative_to(workspace_resolved):
+        raise HarnessExecutionError(
+            "INVALID_SKILL_PACKAGE",
+            "GeneralSkill package path escapes the TaskFrame workspace.",
+        )
+    if target_root.exists() and (target_root.is_symlink() or not target_root.is_dir()):
+        raise HarnessExecutionError(
+            "INVALID_SKILL_PACKAGE",
+            "GeneralSkill package destination is not a safe directory.",
+        )
+    target_root.mkdir(parents=True, exist_ok=True)
+    file_paths: list[str] = []
+    for item in package.files:
+        relative_path = _safe_general_skill_file_path(str(item.path or ""))
+        target = target_root / relative_path
+        if target.exists() and (target.is_symlink() or not target.is_file()):
+            raise HarnessExecutionError(
+                "INVALID_SKILL_PACKAGE",
+                "GeneralSkill package contains an unsafe existing file path.",
+                details={"path": relative_path},
+            )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.parent.resolve().is_relative_to(workspace_resolved):
+            raise HarnessExecutionError(
+                "INVALID_SKILL_PACKAGE",
+                "GeneralSkill package file escapes the TaskFrame workspace.",
+                details={"path": relative_path},
+            )
+        target.write_text(str(item.content or ""), encoding="utf-8")
+        file_paths.append(f"{relative_root}/{relative_path}")
+    return relative_root, file_paths
+
+
+def _safe_general_skill_file_path(path: str) -> str:
+    normalized = path.replace("\\", "/").strip()
+    parts = [part for part in normalized.split("/") if part not in {"", "."}]
+    if (
+        not parts
+        or normalized.startswith("/")
+        or re.match(r"^[A-Za-z]:", normalized)
+        or any(part == ".." for part in parts)
+        or any("\x00" in part for part in parts)
+    ):
+        raise HarnessExecutionError(
+            "INVALID_SKILL_PACKAGE",
+            "GeneralSkill package contains an unsafe file path.",
+            details={"path": path},
+        )
+    return "/".join(parts)
+
+
 def _failure_was_not_sent(result: dict[str, Any]) -> bool:
     error = result.get("error")
     code = str(error.get("code") or "") if isinstance(error, dict) else ""
@@ -1245,6 +1552,14 @@ def _sandbox_path(relative_path: str) -> str:
     if normalized in {"", "."}:
         return SANDBOX_WORKSPACE
     return f"{SANDBOX_WORKSPACE}/{normalized.lstrip('/')}"
+
+
+def _safe_artifact_name(value: str) -> str:
+    cleaned = "".join(
+        character if character.isalnum() or character in {"-", "_", "."} else "-"
+        for character in Path(str(value or "artifact").replace("\\", "/")).name
+    ).strip(".-")
+    return cleaned[:180] or "artifact"
 
 
 def _model_visible_file_result(value: Any, *, key: str = "") -> Any:

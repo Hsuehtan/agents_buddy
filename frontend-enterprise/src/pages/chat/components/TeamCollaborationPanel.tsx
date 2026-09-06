@@ -8,12 +8,56 @@ import { cn } from '@/lib/utils';
 import type {
   AgentProfileRead,
   ChatMessage,
+  KnowledgeCitation,
   TeamConversationMessageRead,
   TeamConversationRead,
   TeamConversationStreamRead,
   TeamConversationsResponse,
   TeamRead,
+  TurnTraceRead,
 } from '@/types';
+import {
+  MarkdownMessage,
+  harnessWorkspaceArtifacts,
+  knowledgeCitations,
+  stripTrailingCitationSummary,
+  traceDetails,
+  traceSummary,
+} from '../chatHelpers';
+import type { TraceLine, TurnTrace } from '../chatTypes';
+import ExecutionRecord from './ExecutionRecord';
+import HarnessArtifactDownloads from './HarnessArtifactDownloads';
+import KnowledgeCitationList from './KnowledgeCitationList';
+
+function collaborationTrace(rows: TurnTraceRead[]): { turnId: string; trace: TurnTrace } | null {
+  const ordered = [...rows].sort(
+    (left, right) => Date.parse(left.started_at) - Date.parse(right.started_at),
+  );
+  const latest = ordered[ordered.length - 1];
+  if (!latest) return null;
+  const lines: TraceLine[] = latest.lines.map((line) => ({
+    id: line.id,
+    kind: line.kind,
+    text: line.text,
+    detail: line.detail || undefined,
+    code: line.code || undefined,
+    language: line.language || undefined,
+    output: line.output || undefined,
+    outputLanguage: line.outputLanguage || undefined,
+    outputTitle: line.outputTitle || undefined,
+    state: line.state,
+    collapsible: Boolean(line.collapsible || line.code || line.output),
+    depth: typeof line.depth === 'number' ? line.depth : undefined,
+  }));
+  return {
+    turnId: latest.turn_id,
+    trace: {
+      lines,
+      startedAt: Date.parse(latest.started_at) || Date.now(),
+      completedAt: latest.completed_at ? Date.parse(latest.completed_at) : undefined,
+    },
+  };
+}
 
 function conversationTitle(conversation: TeamConversationRead): string {
   return staffdeckDisplayText(conversation.title)
@@ -123,16 +167,20 @@ export default function TeamCollaborationPanel({
   team,
   agents,
   conversation,
+  onOpenCitation,
 }: {
   team: TeamRead;
   agents: AgentProfileRead[];
   conversation?: TeamConversationRead;
+  onOpenCitation?: (citation: KnowledgeCitation) => void;
 }) {
   const loadedConversations = useTeamCollaborations(conversation ? undefined : team);
   const conversations = conversation ? [conversation] : loadedConversations;
   const [expandedSessionId, setExpandedSessionId] = useState('');
   const [messagesBySession, setMessagesBySession] = useState<Record<string, TeamConversationMessageRead[]>>({});
   const [streamBySession, setStreamBySession] = useState<Record<string, TeamConversationStreamRead>>({});
+  const [tracesBySession, setTracesBySession] = useState<Record<string, TurnTraceRead[]>>({});
+  const [expandedTraceIds, setExpandedTraceIds] = useState<string[]>([]);
   const [loadingSessionId, setLoadingSessionId] = useState('');
   const [answerByTaskId, setAnswerByTaskId] = useState<Record<string, string>>({});
   const [submittingTaskId, setSubmittingTaskId] = useState('');
@@ -154,11 +202,20 @@ export default function TeamCollaborationPanel({
       if (refreshing) return;
       refreshing = true;
       try {
-        const stream = await api.get<TeamConversationStreamRead>(
-          `/api/enterprise/teams/${team.id}/conversations/${expandedSessionId}/stream?tenant_id=${TENANT_ID}`,
-        );
+        const [stream, traces] = await Promise.all([
+          api.get<TeamConversationStreamRead>(
+            `/api/enterprise/teams/${team.id}/conversations/${expandedSessionId}/stream?tenant_id=${TENANT_ID}`,
+          ),
+          api.get<TurnTraceRead[]>(
+            `/api/chat/sessions/${expandedSessionId}/trace?tenant_id=${TENANT_ID}`,
+          ).catch(() => []),
+        ]);
         if (cancelled) return;
         setStreamBySession((current) => ({ ...current, [expandedSessionId]: stream }));
+        setTracesBySession((current) => ({
+          ...current,
+          [expandedSessionId]: Array.isArray(traces) ? traces : [],
+        }));
         if (stream.status === 'completed' || stream.status === 'failed') {
           const rows = await api.get<TeamConversationMessageRead[]>(
             `/api/enterprise/teams/${team.id}/conversations/${expandedSessionId}/messages?tenant_id=${TENANT_ID}`,
@@ -188,15 +245,25 @@ export default function TeamCollaborationPanel({
       return;
     }
     setExpandedSessionId(conversation.session_id);
-    if (messagesBySession[conversation.session_id]) return;
+    if (messagesBySession[conversation.session_id] && tracesBySession[conversation.session_id]) return;
     setLoadingSessionId(conversation.session_id);
     try {
-      const rows = await api.get<TeamConversationMessageRead[]>(
-        `/api/enterprise/teams/${team.id}/conversations/${conversation.session_id}/messages?tenant_id=${TENANT_ID}`,
-      );
+      const [rows, traces] = await Promise.all([
+        api.get<TeamConversationMessageRead[]>(
+          `/api/enterprise/teams/${team.id}/conversations/${conversation.session_id}/messages?tenant_id=${TENANT_ID}`,
+        ),
+        api.get<TurnTraceRead[]>(
+          `/api/chat/sessions/${conversation.session_id}/trace?tenant_id=${TENANT_ID}`,
+        ).catch(() => []),
+      ]);
       setMessagesBySession((current) => ({ ...current, [conversation.session_id]: rows }));
+      setTracesBySession((current) => ({
+        ...current,
+        [conversation.session_id]: Array.isArray(traces) ? traces : [],
+      }));
     } catch {
       setMessagesBySession((current) => ({ ...current, [conversation.session_id]: [] }));
+      setTracesBySession((current) => ({ ...current, [conversation.session_id]: [] }));
     } finally {
       setLoadingSessionId('');
     }
@@ -238,10 +305,16 @@ export default function TeamCollaborationPanel({
     const memberReplies = (messagesBySession[conversation.session_id] || [])
       .filter((message) => message.role === 'assistant');
     const stream = streamBySession[conversation.session_id];
+    const traceSnapshot = collaborationTrace(tracesBySession[conversation.session_id] || []);
+    const traceLines = traceSnapshot?.trace.lines || [];
+    const traceLineDetails = traceDetails(traceLines);
+    const traceLineSummary = traceSnapshot
+      ? traceSummary(traceSnapshot.trace, traceLines)
+      : null;
     const streamReply = staffdeckDisplayText(stream?.content || '');
     const showStreamReply = Boolean(
       streamReply
-      && !memberReplies.some((message) => staffdeckDisplayText(message.content) === streamReply),
+      && memberReplies.length === 0,
     );
     const preview = staffdeckDisplayText(conversation.preview || '成员正在处理…');
     const taskId = conversation.task_id || '';
@@ -339,48 +412,85 @@ export default function TeamCollaborationPanel({
                 )}
               </div>
             ) : (
-              <button
-                type="button"
-                aria-label={`${expanded ? '收起' : '展开'}${memberName}的回复`}
-                aria-expanded={expanded}
-                onClick={() => void toggleReply(conversation)}
+              <div
                 className="group w-full rounded-[14px] border border-[#e3e7f1] bg-white px-[14px] py-[11px] text-left shadow-[0_1px_2px_rgba(24,24,26,0.03)] transition-colors hover:border-[#cfd6e3]"
               >
-              <span className="flex items-center gap-[8px]">
-                <span className="min-w-0 flex-1 truncate text-[12px] text-[#464c5e]">
-                  {`${memberName}回复：${preview}`}
-                </span>
-                {loading ? (
-                  <LoaderCircle className="size-[13px] shrink-0 animate-spin text-[#858b9c]" />
-                ) : (
-                  <ChevronDown className={cn(
-                    'size-[14px] shrink-0 text-[#858b9c] transition-transform',
-                    expanded && 'rotate-180',
-                  )} />
-                )}
-              </span>
+                <button
+                  type="button"
+                  aria-label={`${expanded ? '收起' : '展开'}${memberName}的回复`}
+                  aria-expanded={expanded}
+                  onClick={() => void toggleReply(conversation)}
+                  className="flex w-full items-center gap-[8px] text-left"
+                >
+                  <span className="min-w-0 flex-1 truncate text-[12px] text-[#464c5e]">
+                    {`${memberName}回复：${preview}`}
+                  </span>
+                  {loading ? (
+                    <LoaderCircle className="size-[13px] shrink-0 animate-spin text-[#858b9c]" />
+                  ) : (
+                    <ChevronDown className={cn(
+                      'size-[14px] shrink-0 text-[#858b9c] transition-transform',
+                      expanded && 'rotate-180',
+                    )} />
+                  )}
+                </button>
               {expanded && !loading && (
-                <span className="mt-[10px] block border-t border-[#eef1f6] pt-[10px]">
-                  {memberReplies.map((message) => (
-                    <span
-                      key={message.id}
-                      className="mb-[8px] block text-[13px] leading-[21px] whitespace-pre-wrap text-[#18181a] last:mb-0"
-                      data-i18n-ignore
-                    >
-                      {staffdeckDisplayText(message.content)}
-                    </span>
-                  ))}
+                <div className="mt-[10px] border-t border-[#eef1f6] pt-[10px]">
+                  {traceSnapshot && traceLineSummary && traceLines.length > 0 && (
+                    <div className="mb-[10px]">
+                      <ExecutionRecord
+                        traceTurnId={traceSnapshot.turnId}
+                        summary={traceLineSummary}
+                        details={traceLineDetails}
+                        expanded={expandedTraceIds.includes(traceSnapshot.turnId)}
+                        onToggle={(turnId, isExpanded) => setExpandedTraceIds((current) => (
+                          isExpanded
+                            ? current.filter((item) => item !== turnId)
+                            : [...current.filter((item) => item !== turnId), turnId]
+                        ))}
+                      />
+                    </div>
+                  )}
+                  {memberReplies.map((message) => {
+                    const chatMessage: ChatMessage = {
+                      ...message,
+                      role: 'assistant',
+                    };
+                    const visibleContent = stripTrailingCitationSummary(
+                      staffdeckDisplayText(message.content),
+                    );
+                    const citations = knowledgeCitations(chatMessage, visibleContent);
+                    const artifacts = harnessWorkspaceArtifacts(chatMessage);
+                    return (
+                      <div
+                        key={message.id}
+                        className="mb-[10px] text-[13px] leading-[21px] text-[#18181a] last:mb-0"
+                        data-i18n-ignore
+                      >
+                        <MarkdownMessage content={visibleContent} />
+                        <HarnessArtifactDownloads
+                          artifacts={artifacts}
+                          tenantId={TENANT_ID}
+                          sessionId={conversation.session_id}
+                        />
+                        <KnowledgeCitationList
+                          citations={citations}
+                          onOpen={(citation) => onOpenCitation?.(citation)}
+                        />
+                      </div>
+                    );
+                  })}
                   {showStreamReply && (
-                    <span
-                      className="mb-[8px] block whitespace-pre-wrap text-[13px] leading-[21px] text-[#18181a] last:mb-0"
+                    <div
+                      className="mb-[8px] block text-[13px] leading-[21px] text-[#18181a] last:mb-0"
                       aria-live="polite"
                       data-i18n-ignore
                     >
-                      {streamReply}
+                      <MarkdownMessage content={streamReply} />
                       {stream?.status === 'running' && (
                         <span className="ml-[3px] inline-block h-[14px] w-[2px] animate-pulse rounded-full bg-[#1a71ff] align-[-2px]" />
                       )}
-                    </span>
+                    </div>
                   )}
                   {memberReplies.length === 0 && !showStreamReply && (
                     <span className="flex items-center gap-[6px] text-[12px] text-[#a7adbb]">
@@ -390,9 +500,9 @@ export default function TeamCollaborationPanel({
                       {stream?.phase || '成员正在处理，回复会实时显示在这里'}
                     </span>
                   )}
-                </span>
+                </div>
               )}
-              </button>
+              </div>
             )}
           </div>
         </div>

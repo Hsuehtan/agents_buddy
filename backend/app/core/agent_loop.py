@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterator
 from time import sleep
 from typing import Any, Literal
@@ -14,7 +15,12 @@ from app.agents.branching import (
 from app.channels.service_outbox import stage_channel_delivery
 from app.core.agent_identity_prompt import AgentIdentityPrompt
 from app.core.cancellation import clear_chat_turn_cancelled
-from app.core.conversation_context import build_conversation_context
+from app.core.conversation_context import (
+    ConversationContextSettings,
+    build_conversation_context,
+)
+from app.core.conversation_projection import ConversationProjection
+from app.core.graph_rules import GraphRules
 from app.core.harness_agent import HarnessExecutionCancelled
 from app.core.harness_session_lock import HarnessSessionBusy
 from app.core.harness_turn_store import HarnessTurnConflict
@@ -24,9 +30,6 @@ from app.core.harness_v2_engine import (
     get_or_create_harness_session,
 )
 from app.core.human_handoff_service import HumanHandoffService
-from app.core.conversation_projection import ConversationProjection
-from app.core.graph_rules import GraphRules
-from app.core.turn_finalizer import TurnFinalizer
 from app.core.response_generator import (
     ResponseGenerator,
     format_runtime_failure_reply,
@@ -34,8 +37,10 @@ from app.core.response_generator import (
 )
 from app.core.skill_runtime import SkillRuntime
 from app.core.slash_commands import SlashCommandError
+from app.core.turn_finalizer import TurnFinalizer
 from app.db.models import (
     AgentProfile,
+    ChannelBinding,
     ChatSession,
     HarnessTurnRecord,
     HumanHandoffRequest,
@@ -71,6 +76,8 @@ from app.session.session_schema import (
 )
 from app.tools.tool_schema import ToolResult
 
+logger = logging.getLogger(__name__)
+
 STREAM_CHUNK_INTERVAL_SECONDS = 0.045
 MAX_TOOL_ACTIONS_PER_TURN = 32
 MAX_TOOL_ACTIONS_PER_TURN_LIMIT = 100
@@ -89,6 +96,18 @@ def _knowledge_scope_ids(
         singular = scope.get(singular_key)
         values = [singular] if singular else []
     return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+
+
+def _find_handoff_node_id_in_skill(
+    skill: Skill, active_step_id: str | None = None
+) -> str | None:
+    """查找 SOP 中从当前节点可达的 handoff 节点。
+
+    使用 GraphRules.find_handoff_node_id 做基于 edges 的 BFS,
+    优先返回从 active_step_id 可达的 handoff 节点,而非数组顺序的第一个。
+    """
+    content = skill.content_json or {}
+    return GraphRules.find_handoff_node_id(content, active_step_id)
 
 
 def _agent_identity_prompt(agent: AgentProfile) -> str:
@@ -127,9 +146,12 @@ class AgentLoop:
         db: Session,
         *,
         event_sink: Callable[[str, dict[str, Any]], None] | None = None,
+        stream_sink: Any | None = None,
     ) -> None:
         self.db = db
         self.events = EventLog(db, event_sink=event_sink)
+        self.stream_sink = stream_sink
+        self.stream_delivery_succeeded = False
         self.runtime = SkillRuntime()
         self.response_generator = ResponseGenerator()
         self.memory = MemoryService(db)
@@ -483,9 +505,36 @@ class AgentLoop:
         if not skill:
             return False
         current_step = self._current_skill_step(skill, active_step_id)
-        if not current_step:
+        return bool(current_step and self._step_declares_human_handoff(current_step))
+
+    def _maybe_route_to_handoff_node(
+        self, chat_session: ChatSession, active_skill: Skill | None
+    ) -> bool:
+        """当 step_result.handoff=True 但当前 step 不声明 handoff 时,
+        查找 SOP 中的 handoff 节点并路由到它。这使得后续的
+        _create_human_handoff_request 能从 handoff 节点读取 assignee_user_id。
+
+        返回 True 表示已路由到 handoff 节点。
+        """
+        if not active_skill or not chat_session.active_skill_id:
             return False
-        return self._step_declares_human_handoff(current_step)
+        current_step = self._current_skill_step(
+            active_skill, chat_session.active_step_id
+        )
+        if current_step and self._step_declares_human_handoff(current_step):
+            return False
+        handoff_step_id = _find_handoff_node_id_in_skill(
+            active_skill, chat_session.active_step_id
+        )
+        if not handoff_step_id:
+            return False
+        self._change_active_step(
+            chat_session.tenant_id,
+            chat_session,
+            handoff_step_id,
+            reason="handoff_node_routed_by_step_result",
+        )
+        return True
 
     def _step_declares_human_handoff(self, step: dict[str, Any]) -> bool:
         node_type = str(step.get("type") or "").strip()
@@ -545,6 +594,13 @@ class AgentLoop:
             return False
         if tool_result and not tool_result.success:
             return False
+        # Graph topology is authoritative for SOP completion. A non-terminal
+        # node may allow an interim reply and all global slots may already be
+        # filled, but an outgoing edge still means the workflow has work left.
+        # Check this before the reply/tool completion shortcuts so transitioning
+        # into an intermediate node cannot finish the entire SOP.
+        if self._graph_flow_has_unfinished_work(skill, chat_session, step_result):
+            return False
         if (
             tool_result
             and tool_result.success
@@ -559,8 +615,6 @@ class AgentLoop:
             return True
         if not step_result.next_step_id and not step_result.tool_call:
             return True
-        if self._graph_flow_has_unfinished_work(skill, chat_session, step_result):
-            return False
         return self._is_terminal_skill_state(skill, chat_session)
 
     def _is_terminal_skill_state(self, skill: Skill, chat_session: ChatSession) -> bool:
@@ -669,6 +723,7 @@ class AgentLoop:
             step_result,
             tool_result,
             current_step_allows_handoff=self._current_step_allows_human_handoff,
+            route_to_handoff_node=self._maybe_route_to_handoff_node,
             create_handoff=self._create_human_handoff_request,
             record_event=self.events.record,
             should_complete=self._should_complete_skill,
@@ -682,18 +737,133 @@ class AgentLoop:
         active_skill: Skill | None,
         step_result: StepAgentResult,
     ) -> HumanHandoffRequest:
-        return HumanHandoffService(self.db, self.events).create(
+        # SOP 节点指定的处理人:从当前 step 的 assignee_user_id 字段读取
+        # (handoff 类型节点或 allowed_actions 含 handoff_human 的节点可配置)。
+        # assignee_notify_channel 指定投递渠道:None=默认;"web"=仅网页端;绑定渠道=按渠道转接。
+        step_assignee_user_id: str | None = None
+        step_notify_channel: str | None = None
+        current_step = (
+            self._current_skill_step(active_skill, chat_session.active_step_id)
+            if active_skill
+            else None
+        )
+        if isinstance(current_step, dict):
+            step_assignee_user_id = (
+                str(current_step.get("assignee_user_id") or "").strip() or None
+            )
+            step_notify_channel = (
+                str(current_step.get("assignee_notify_channel") or "").strip() or None
+            )
+        # 当前渠道默认处理人:从会话所属 binding 的 config_json 读取。
+        binding_default_assignee_user_id, binding_default_notify_channel = (
+            self._binding_default_handoff_assignee(tenant_id, chat_session)
+        )
+        handoff = HumanHandoffService(self.db, self.events).create(
             tenant_id,
             chat_session,
             step_result,
-            current_step_resolver=lambda: (
-                self._current_skill_step(active_skill, chat_session.active_step_id)
-                if active_skill
-                else None
-            ),
+            current_step_resolver=lambda: current_step,
             assignee_resolver=self._human_handoff_assignee_user_id,
             context_summary=self._human_handoff_context_summary,
             pending_question=self._human_handoff_pending_question,
+            step_assignee_user_id=step_assignee_user_id,
+            binding_default_assignee_user_id=binding_default_assignee_user_id,
+            step_notify_channel=step_notify_channel,
+            binding_default_notify_channel=binding_default_notify_channel,
+        )
+        # 给 assignee 发渠道私聊通知。失败仅记日志,不影响 handoff 主流程
+        # (网页收件箱仍可兜底)。
+        self._maybe_notify_handoff_assignee(tenant_id, chat_session, handoff)
+        return handoff
+
+    def _binding_default_handoff_assignee(
+        self,
+        tenant_id: str,
+        chat_session: ChatSession,
+    ) -> tuple[str | None, str | None]:
+        """会话所属渠道绑定配置的默认人工处理人及其通知渠道。
+
+        从 ChatSession.channel_binding_id 反查 binding(而非 agent 挂载列表取首个),
+        读取 config_json.default_handoff_assignee_user_id 与
+        default_handoff_assignee_channel。无 binding 或未配置返回 (None, None)。
+        """
+        if not chat_session.channel_binding_id:
+            return None, None
+        binding = self.db.get(ChannelBinding, chat_session.channel_binding_id)
+        if not binding or binding.tenant_id != tenant_id:
+            return None, None
+        config = binding.config_json if isinstance(binding.config_json, dict) else {}
+        value = str(config.get("default_handoff_assignee_user_id") or "").strip()
+        if not value:
+            return None, None
+        channel = str(config.get("default_handoff_assignee_channel") or "").strip()
+        return value, (channel or None)
+
+    def _maybe_notify_handoff_assignee(
+        self,
+        tenant_id: str,
+        chat_session: ChatSession,
+        handoff: HumanHandoffRequest,
+    ) -> None:
+        """按通知渠道偏好解析投递 binding,给 assignee 登记渠道私聊通知。
+
+        绑定解析规则:
+        - 偏好为具体渠道(如 feishu)时:优先会话所属 binding(渠道匹配且 active);
+          会话无 binding 或渠道不匹配时,在租户内找该渠道的任一 active 员工绑定。
+        - 偏好为 None(默认)时:用会话所属 binding(渠道支持私聊通知即可达)。
+        - 偏好为 "web" 时:仅网页收件箱,直接返回。
+
+        无可用 binding(含日志说明)或 assignee 在该 binding scope 无非群聊身份时,
+        由 notify_handoff_assignee 内部跳过,网页收件箱兜底。
+        """
+        from app.channels.service_outbox import (
+            HANDOFF_NOTIFY_CHANNELS,
+            notify_handoff_assignee,
+            resolve_handoff_notify_binding,
+        )
+
+        metadata = handoff.metadata_json if isinstance(handoff.metadata_json, dict) else {}
+        notify_channel = str(metadata.get("assignee_notify_channel") or "").strip()
+        if notify_channel == "web":
+            return
+        binding: ChannelBinding | None = None
+        if notify_channel:
+            # 指定渠道:优先会话所属 binding,渠道不匹配时回退租户内该渠道任一 binding。
+            if chat_session.channel_binding_id:
+                session_binding = self.db.get(ChannelBinding, chat_session.channel_binding_id)
+                if (
+                    session_binding
+                    and session_binding.tenant_id == tenant_id
+                    and session_binding.channel == notify_channel
+                    and session_binding.status == "active"
+                ):
+                    binding = session_binding
+            binding = binding or resolve_handoff_notify_binding(self.db, tenant_id, notify_channel)
+            if binding is None:
+                logger.warning(
+                    "handoff 通知跳过:租户无可用的 %s 绑定 handoff=%s", notify_channel, handoff.id
+                )
+                return
+        else:
+            # 默认投递:用会话所属 binding,渠道支持私聊通知即可达。
+            if not chat_session.channel_binding_id:
+                return
+            session_binding = self.db.get(ChannelBinding, chat_session.channel_binding_id)
+            if (
+                not session_binding
+                or session_binding.tenant_id != tenant_id
+                or session_binding.status != "active"
+            ):
+                return
+            if session_binding.channel not in HANDOFF_NOTIFY_CHANNELS:
+                return
+            binding = session_binding
+        notify_handoff_assignee(
+            self.db,
+            binding,
+            handoff,
+            handoff.pending_question or "",
+            handoff.context_summary or "",
         )
 
     def _apply_step_result(
@@ -995,8 +1165,8 @@ class AgentLoop:
                 user_id=request.user_id,
                 agent_id=request.agent_id,
                 channel=(
-                    PILOTDECK_GROUP_CHAT_CHANNEL
-                    if request.channel == PILOTDECK_GROUP_CHAT_CHANNEL
+                    request.channel
+                    if request.channel in {PILOTDECK_GROUP_CHAT_CHANNEL, "skill_test"}
                     else None
                 ),
             )
@@ -1061,6 +1231,49 @@ class AgentLoop:
         row = self.db.get(UIConfig, tenant_id)
         value = row.agent_loop_max_actions if row else MAX_TOOL_ACTIONS_PER_TURN
         return max(1, min(int(value), MAX_TOOL_ACTIONS_PER_TURN_LIMIT))
+
+    def _get_conversation_context_settings(
+        self,
+        tenant_id: str,
+    ) -> ConversationContextSettings:
+        if not hasattr(self.db, "get"):
+            return ConversationContextSettings()
+        row = self.db.get(UIConfig, tenant_id)
+        if row is None:
+            return ConversationContextSettings()
+        return ConversationContextSettings(
+            token_budget=getattr(row, "context_token_budget", 32_000),
+            compaction_trigger_ratio=getattr(
+                row,
+                "context_compaction_trigger_ratio",
+                0.70,
+            ),
+            recent_round_limit=getattr(row, "context_recent_round_limit", 6),
+            long_summary_token_budget=getattr(
+                row,
+                "context_long_summary_token_budget",
+                4_000,
+            ),
+            medium_summary_token_budget=getattr(
+                row,
+                "context_medium_summary_token_budget",
+                4_000,
+            ),
+            allowed_roles=frozenset(
+                getattr(row, "context_allowed_roles", None)
+                or {"user", "assistant"}
+            ),
+            long_summary_prefix=getattr(
+                row,
+                "context_long_summary_prefix",
+                "历史的信息可以被总结为：",
+            ),
+            medium_summary_prefix=getattr(
+                row,
+                "context_medium_summary_prefix",
+                "近期的历史信息总结为：",
+            ),
+        ).normalized()
 
     def _list_published_skills(self, tenant_id: str, agent_id: str | None = None) -> list[Skill]:
         return visible_published_skills(self.db, tenant_id, agent_id)
@@ -1204,6 +1417,7 @@ class AgentLoop:
                 )
                 for row in visible_rows
             ],
+            settings=self._get_conversation_context_settings(chat_session.tenant_id),
             context_state=chat_session.context_state_json,
             summary_builder=self._context_summary_builder(model_config) if model_config else None,
         )
@@ -1458,7 +1672,8 @@ class AgentLoop:
             reply,
             metadata=assistant_metadata,
         )
-        stage_channel_delivery(self.db, chat_session, assistant_message)
+        if not self.stream_delivery_succeeded:
+            stage_channel_delivery(self.db, chat_session, assistant_message)
         event_payload: dict[str, Any] = {
             "message_id": assistant_message.id,
             "assistant_message_id": assistant_message.id,

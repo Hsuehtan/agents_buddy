@@ -1,10 +1,16 @@
 from __future__ import annotations
 
 import base64
+from datetime import UTC, datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlmodel import Session, select
 
+from app.api.sessions import (
+    _json_download_response,
+    _safe_filename_part,
+    _session_details_payload,
+)
 from app.async_jobs import enqueue_async_job
 from app.core import AgentLoop
 from app.db import get_session
@@ -18,6 +24,7 @@ from app.db.models import (
     TeamTask,
     TeamTaskBid,
     TeamTaskEvent,
+    TeamWakeEvent,
     User,
     new_id,
     utc_now,
@@ -27,6 +34,7 @@ from app.security.auth import get_current_user
 from app.security.permissions import is_admin_user as _is_admin_user
 from app.security.tenant import ensure_tenant
 from app.session.message_visibility import visible_message_content, visible_message_rows
+from app.session.message_read import message_read
 from app.session.session_schema import ChatTurnRequest
 from app.teams import service as team_service
 from app.teams.schema import (
@@ -81,14 +89,16 @@ from app.teams.service import (
     write_blackboard_entries,
 )
 from app.teams.wakeup import (
+    activate_ready_tasks,
     build_tl_chat_context,
     enqueue_wake_event,
     process_tl_reply,
     start_bidding,
     start_wakeup_async,
 )
-
 router = APIRouter(prefix="/api/enterprise/teams", tags=["enterprise:teams"])
+
+TEAM_LOG_EXPORT_SCHEMA = "staffdeck.team-conversation-log.v1"
 
 # 可被人改判的任务状态:TL 验收后(review)或已升级(escalated)
 OVERRIDABLE_STATUSES = {"review", "escalated"}
@@ -182,6 +192,8 @@ def _task_read(db: Session, task: TeamTask, *, with_events: bool = False) -> Tea
         id=task.id,
         team_id=task.team_id,
         tenant_id=task.tenant_id,
+        team_run_id=task.team_run_id,
+        source_turn_id=task.source_turn_id,
         parent_task_id=task.parent_task_id,
         title=task.title,
         description=task.description,
@@ -191,6 +203,8 @@ def _task_read(db: Session, task: TeamTask, *, with_events: bool = False) -> Tea
         created_by_tl=task.created_by_tl,
         assignee_agent_id=task.assignee_agent_id,
         session_id=task.session_id,
+        depends_on_task_ids=list(task.depends_on_task_ids_json or []),
+        activation_condition=dict(task.activation_condition_json or {}),
         report=dict(task.report_json or {}),
         review=dict(task.review_json or {}),
         version=task.version,
@@ -622,15 +636,24 @@ def list_team_conversation_messages(
         select(Message).where(Message.session_id == session.id).order_by(Message.created_at)
     ).all()
     rows = visible_message_rows(rows)
-    return [
-        TeamConversationMessageRead(
-            id=row.id,
-            role=row.role,
-            content=visible_message_content(row),
-            created_at=row.created_at,
+    result: list[TeamConversationMessageRead] = []
+    for row in rows:
+        serialized = message_read(
+            row,
+            db=db,
+            content_override=team_service.strip_team_control_blocks(visible_message_content(row)),
         )
-        for row in rows
-    ]
+        result.append(
+            TeamConversationMessageRead(
+                id=serialized.id,
+                role=serialized.role,
+                content=serialized.content,
+                metadata=dict(serialized.metadata or {}),
+                turn_id=serialized.turn_id,
+                created_at=row.created_at,
+            )
+        )
+    return result
 
 
 @router.get(
@@ -780,6 +803,74 @@ def create_team_task_endpoint(
     else:
         start_bidding(db, team, task)
     return _task_read(db, task, with_events=True)
+
+
+@router.get("/{team_id}/export")
+def export_team_conversation_log(
+    team_id: str,
+    tenant_id: str = Query(...),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> Response:
+    """下载团队完整审计日志，包含任务调度与全部关联成员会话的原始执行记录。"""
+    ensure_tenant(db, tenant_id)
+    _ensure_request_tenant(tenant_id, current_user)
+    team = get_team(db, tenant_id, team_id)
+    _ensure_team_manager(team, current_user)
+
+    task_rows = db.exec(
+        select(TeamTask)
+        .where(TeamTask.team_id == team.id)
+        .order_by(TeamTask.created_at)
+    ).all()
+    wake_rows = db.exec(
+        select(TeamWakeEvent)
+        .where(TeamWakeEvent.team_id == team.id)
+        .order_by(TeamWakeEvent.created_at)
+    ).all()
+    blackboard_rows = db.exec(
+        select(TeamBlackboardEntry)
+        .where(TeamBlackboardEntry.team_id == team.id)
+        .order_by(TeamBlackboardEntry.created_at)
+    ).all()
+
+    # 兼容旧数据：早期成员执行会话没有 team_id，只通过 TeamTask.session_id 关联。
+    session_rows = db.exec(
+        select(ChatSession)
+        .where(ChatSession.tenant_id == tenant_id, ChatSession.team_id == team.id)
+        .order_by(ChatSession.created_at)
+    ).all()
+    session_by_id = {row.id: row for row in session_rows}
+    for task in task_rows:
+        if task.session_id and task.session_id not in session_by_id:
+            row = db.get(ChatSession, task.session_id)
+            if row is not None and row.tenant_id == tenant_id:
+                session_by_id[row.id] = row
+    ordered_sessions = sorted(session_by_id.values(), key=lambda row: row.created_at)
+
+    payload = {
+        "schema_version": TEAM_LOG_EXPORT_SCHEMA,
+        "exported_at": datetime.now(UTC).isoformat(),
+        "team": _team_read(db, team).model_dump(mode="json"),
+        "summary": {
+            "task_count": len(task_rows),
+            "wake_event_count": len(wake_rows),
+            "blackboard_entry_count": len(blackboard_rows),
+            "session_count": len(ordered_sessions),
+        },
+        "tasks": [
+            _task_read(db, task, with_events=True).model_dump(mode="json")
+            for task in task_rows
+        ],
+        "wake_events": [row.model_dump(mode="json") for row in wake_rows],
+        "blackboard_entries": [row.model_dump(mode="json") for row in blackboard_rows],
+        # 与普通对话日志完全复用同一构建链路：消息、反馈、公开 Trace、原始 AgentEvent、
+        # 模型输入/输出/reasoning 以及工具参数/结果均由 session detail 统一导出。
+        "sessions": _session_details_payload(db, tenant_id, ordered_sessions),
+    }
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    filename = f"staffdeck-team-log-{_safe_filename_part(team.id)}-{timestamp}.json"
+    return _json_download_response(payload, filename)
 
 
 @router.get("/{team_id}/events", response_model=list[TeamEventRead])
@@ -963,6 +1054,8 @@ def override_task_review(
     db.add(task)
     db.commit()
     db.refresh(task)
+    if target in {"done", "escalated"}:
+        activate_ready_tasks(db, team)
     if request.verdict == "rework" and task.assignee_agent_id:
         wake = enqueue_wake_event(
             db,

@@ -10,21 +10,37 @@ from sqlmodel import Session, select
 
 from app.db.models import (
     AgentProfile,
+    ChatSession,
     Team,
     TeamBlackboardEntry,
     TeamMember,
+    TeamRun,
     TeamTask,
     TeamTaskBid,
     TeamTaskEvent,
     TeamWakeEvent,
     utc_now,
 )
+from app.session.cleanup import (
+    purge_chat_session_records,
+    remove_chat_session_workspace,
+)
 
 TEAM_MEMBER_ROLES = {"leader", "member"}
 
 # 任务状态机:bidding 由竞标流程驱动,bidding -> pending 为中标/改判后待执行。
-TASK_STATUSES = {"pending", "bidding", "in_progress", "review", "done", "rework", "escalated"}
+TASK_STATUSES = {
+    "blocked",
+    "pending",
+    "bidding",
+    "in_progress",
+    "review",
+    "done",
+    "rework",
+    "escalated",
+}
 TASK_TRANSITIONS: dict[str, set[str]] = {
+    "blocked": {"pending", "escalated"},
     "pending": {"bidding", "in_progress", "escalated"},
     "in_progress": {"review", "escalated"},
     "review": {"done", "rework", "escalated"},
@@ -62,13 +78,42 @@ def strip_json_blocks(text: str) -> str:
     return _JSON_BLOCK_RE.sub("", text or "").strip()
 
 
-def parse_tl_task_assignments(reply: str) -> list[dict[str, str]]:
-    """解析 TL 派任务块:{"team_tasks": [{title, description?, assignee_agent_id?}...]}。
+def strip_team_control_blocks(text: str) -> str:
+    """只隐藏团队运行控制块，保留普通 JSON 代码示例供人阅读。"""
+
+    def replace(match: re.Match[str]) -> str:
+        try:
+            value = json.loads(match.group(1))
+        except (json.JSONDecodeError, ValueError):
+            return match.group(0)
+        if isinstance(value, dict) and any(
+            key in value
+            for key in ("team_tasks", "team_review", "blackboard_suggestions", "bid", "bid_scores", "bid_award")
+        ):
+            return ""
+        return match.group(0)
+
+    return _JSON_BLOCK_RE.sub(replace, text or "").strip()
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result
+
+
+def parse_tl_task_assignments(reply: str) -> list[dict[str, Any]]:
+    """解析 TL 派任务块，并保留稳定引用、依赖与通用激活条件。
 
     assignee_agent_id 缺省/为空表示投入任务池由成员竞标;无块或结构非法时
     返回空列表(纯对话,不改状态)。
     """
-    tasks: list[dict[str, str]] = []
+    tasks: list[dict[str, Any]] = []
     for block in extract_json_blocks(reply):
         raw_tasks = block.get("team_tasks")
         if not isinstance(raw_tasks, list):
@@ -79,24 +124,76 @@ def parse_tl_task_assignments(reply: str) -> list[dict[str, str]]:
             title = str(item.get("title") or "").strip()
             if not title:
                 continue
-            task: dict[str, str] = {"title": title}
+            task: dict[str, Any] = {"title": title}
             assignee = str(item.get("assignee_agent_id") or "").strip()
             if assignee:
                 task["assignee_agent_id"] = assignee
             description = str(item.get("description") or "").strip()
             if description:
                 task["description"] = description
+            client_ref = str(item.get("client_ref") or "").strip()
+            if client_ref:
+                task["client_ref"] = client_ref
+            depends_on = _string_list(item.get("depends_on"))
+            if depends_on:
+                task["depends_on"] = depends_on
+            depends_on_task_ids = _string_list(item.get("depends_on_task_ids"))
+            if depends_on_task_ids:
+                task["depends_on_task_ids"] = depends_on_task_ids
+            condition = item.get("activation_condition")
+            if isinstance(condition, str):
+                condition = {"type": condition}
+            if isinstance(condition, dict):
+                task["activation_condition"] = dict(condition)
             tasks.append(task)
     return tasks
 
 
-_DISPATCH_KEYWORDS = ("派", "任务", "安排", "分配", "指派")
-
-
-def looks_like_dispatch_intent(user_message: str, reply: str) -> bool:
-    """启发式判断本轮是否意在派发任务;命中才值得补一次格式纠错 turn。"""
-    text = f"{user_message}\n{reply}"
-    return any(keyword in text for keyword in _DISPATCH_KEYWORDS)
+def task_activation_state(db: Session, task: TeamTask) -> str:
+    """计算 blocked 任务的通用激活结果:ready / blocked / impossible。"""
+    dependency_ids = list(task.depends_on_task_ids_json or [])
+    if not dependency_ids:
+        return "ready"
+    dependencies = [db.get(TeamTask, task_id) for task_id in dependency_ids]
+    if any(item is None or item.team_id != task.team_id for item in dependencies):
+        return "impossible"
+    rows = [item for item in dependencies if item is not None]
+    statuses = [item.status for item in rows]
+    # escalated 也承载“等待用户补充信息”这一可恢复状态，不能把它当成依赖终态。
+    waiting_for_input = [
+        item.status == "escalated" and bool((item.report_json or {}).get("needs_input"))
+        for item in rows
+    ]
+    terminal = [
+        status == "done" or (status == "escalated" and not waiting)
+        for status, waiting in zip(statuses, waiting_for_input, strict=True)
+    ]
+    succeeded = sum(status == "done" for status in statuses)
+    condition = dict(task.activation_condition_json or {})
+    condition_type = str(condition.get("type") or "all_succeeded")
+    if condition_type == "any_succeeded":
+        if succeeded:
+            return "ready"
+        return "impossible" if all(terminal) else "blocked"
+    if condition_type == "minimum_succeeded":
+        try:
+            minimum = max(1, min(len(rows), int(condition.get("minimum") or 1)))
+        except (TypeError, ValueError):
+            minimum = 1
+        if succeeded >= minimum:
+            return "ready"
+        remaining = sum(not item_terminal for item_terminal in terminal)
+        return "impossible" if succeeded + remaining < minimum else "blocked"
+    if condition_type == "all_terminal":
+        return "ready" if all(terminal) else "blocked"
+    if succeeded == len(statuses):
+        return "ready"
+    if any(
+        item_terminal and status != "done"
+        for item_terminal, status in zip(terminal, statuses, strict=True)
+    ):
+        return "impossible"
+    return "blocked"
 
 
 def parse_bid(reply: str) -> dict[str, str] | None:
@@ -281,8 +378,9 @@ def create_team(
 
 
 def delete_team(db: Session, team: Team) -> None:
-    """删除团队并级联清理成员/任务/竞标/审计/唤醒事件/黑板。"""
+    """删除团队并级联清理成员/运行/任务/竞标/审计/唤醒事件/黑板/团队会话。"""
     members = list_team_members(db, team.id)
+    runs = list(db.exec(select(TeamRun).where(TeamRun.team_id == team.id)).all())
     tasks = list(db.exec(select(TeamTask).where(TeamTask.team_id == team.id)).all())
     bids = list(db.exec(select(TeamTaskBid).where(TeamTaskBid.team_id == team.id)).all())
     events = list(db.exec(select(TeamTaskEvent).where(TeamTaskEvent.team_id == team.id)).all())
@@ -290,10 +388,18 @@ def delete_team(db: Session, team: Team) -> None:
     entries = list(
         db.exec(select(TeamBlackboardEntry).where(TeamBlackboardEntry.team_id == team.id)).all()
     )
-    for row in [*members, *tasks, *bids, *events, *wakes, *entries]:
+    sessions = list(
+        db.exec(select(ChatSession).where(ChatSession.team_id == team.id)).all()
+    )
+    workspace_keys = [(session.tenant_id, session.id) for session in sessions]
+    for row in [*members, *runs, *tasks, *bids, *events, *wakes, *entries]:
         db.delete(row)
+    for session in sessions:
+        purge_chat_session_records(db, session)
     db.delete(team)
     db.commit()
+    for tenant_id, session_id in workspace_keys:
+        remove_chat_session_workspace(tenant_id=tenant_id, session_id=session_id, db=db)
 
 
 def _ensure_team_agent(db: Session, team: Team, agent_id: str) -> AgentProfile:
@@ -398,7 +504,14 @@ def apply_task_transition(
     """按状态机迁移任务状态并写审计;非法流转抛 TeamTaskTransitionError。"""
     if new_status not in TASK_STATUSES:
         raise TeamTaskTransitionError(f"未知任务状态: {new_status}")
-    if new_status != task.status and new_status not in TASK_TRANSITIONS.get(task.status, set()):
+    planner_run_completed = bool(
+        task.team_run_id and task.status == "in_progress" and new_status == "done"
+    )
+    if (
+        new_status != task.status
+        and new_status not in TASK_TRANSITIONS.get(task.status, set())
+        and not planner_run_completed
+    ):
         raise TeamTaskTransitionError(f"任务不允许从 {task.status} 流转到 {new_status}")
     previous = task.status
     task.status = new_status
@@ -440,13 +553,20 @@ def open_tasks_summary(db: Session, team: Team) -> list[str]:
     rows = db.exec(
         select(TeamTask).where(
             TeamTask.team_id == team.id,
-            TeamTask.status.in_(["pending", "in_progress", "review", "rework"]),
+            TeamTask.status.in_(["blocked", "pending", "in_progress", "review", "rework"]),
         )
     ).all()
-    return [
-        f"- task_id={row.id} 标题={row.title} 状态={row.status} 负责人={row.assignee_agent_id or '未指派'}"
-        for row in rows
-    ]
+    result: list[str] = []
+    for row in rows:
+        line = (
+            f"- task_id={row.id} 标题={row.title} 状态={row.status} "
+            f"负责人={row.assignee_agent_id or '未指派'}"
+        )
+        dependencies = list(row.depends_on_task_ids_json or [])
+        if dependencies:
+            line += f" 前置任务={','.join(dependencies)} 激活条件={row.activation_condition_json or {}}"
+        result.append(line)
+    return result
 
 
 # ---------- 团队黑板 ----------

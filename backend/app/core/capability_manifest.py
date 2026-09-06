@@ -17,6 +17,7 @@ from app.capabilities.local_general_skill import package_from_row
 from app.core.task_request_compiler import (
     CapabilityDescriptor,
     CapabilityManifest,
+    current_step_authorization_skill_ids,
     current_step_capability_refs,
 )
 from app.db.models import (
@@ -28,13 +29,20 @@ from app.db.models import (
     Tool,
     UIConfig,
 )
-from app.harness import build_file_tool_registry, register_command_tools
+from app.harness import (
+    build_file_tool_registry,
+    register_command_tools,
+    register_skill_script_tools,
+)
 from app.harness.sandbox import available_backend
 
 RESERVED_HARNESS_CAPABILITY_NAMES = {
     "capability_search",
     "capability_describe",
+    "list_published_deliverables",
+    "read_published_deliverable",
     "exec_command",
+    "run_skill_script",
     "knowledge_search",
 }
 
@@ -57,6 +65,7 @@ class CapabilityManifestBuilder:
         if agent_id and get_agent(self.db, tenant_id, agent_id) is None:
             raise CapabilityAuthorizationError("当前员工不存在、已归档或不属于该租户。")
         refs = current_step_capability_refs(skill, step_id)
+        authorization_skill_ids = current_step_authorization_skill_ids(skill, step_id)
         available: list[CapabilityDescriptor] = []
         unavailable: list[CapabilityDescriptor] = []
 
@@ -66,8 +75,9 @@ class CapabilityManifestBuilder:
 
         builtin_registry = build_file_tool_registry()
         register_command_tools(builtin_registry)
+        register_skill_script_tools(builtin_registry)
         for spec in builtin_registry.specs():
-            is_command = spec.name == "exec_command"
+            is_command = spec.name in {"exec_command", "run_skill_script"}
             available.append(
                 CapabilityDescriptor(
                     capability_id=(
@@ -179,8 +189,8 @@ class CapabilityManifestBuilder:
             explicitly_allowed = any(tool_by_ref.get(ref) is row for ref in refs["tool_ids"])
             if scope == "sop_specific" and not explicitly_allowed:
                 continue
-            if row.allowed_skills_json and (
-                skill is None or skill.skill_id not in row.allowed_skills_json
+            if row.allowed_skills_json and not authorization_skill_ids.intersection(
+                str(value).strip() for value in row.allowed_skills_json if str(value).strip()
             ):
                 if explicitly_allowed:
                     unavailable.append(
@@ -347,6 +357,51 @@ class CapabilityManifestBuilder:
 
 def _internal_capability_descriptors() -> list[CapabilityDescriptor]:
     return [
+        CapabilityDescriptor(
+            capability_id="builtin.deliverables.list",
+            name="list_published_deliverables",
+            kind="internal",
+            description=(
+                "List recent files published by earlier TaskFrames in this same conversation. "
+                "Use this before continuing work from a document delivered in a previous turn."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "default": 20,
+                    },
+                },
+                "additionalProperties": False,
+            },
+            metadata={"provider": "harness", "side_effect": "read"},
+        ),
+        CapabilityDescriptor(
+            capability_id="builtin.deliverables.read",
+            name="read_published_deliverable",
+            kind="internal",
+            description=(
+                "Read UTF-8 content from one file returned by list_published_deliverables. "
+                "Pass its task_frame_id and path exactly; use the continuation token when truncated."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "task_frame_id": {"type": "string", "minLength": 1},
+                    "path": {"type": "string", "minLength": 1},
+                    "offset": {"type": "integer", "minimum": 0, "default": 0},
+                    "max_bytes": {"type": "integer", "minimum": 1},
+                    "continuation_token": {"type": "string", "minLength": 1},
+                },
+                "required": ["task_frame_id", "path"],
+                "additionalProperties": False,
+            },
+            metadata={"provider": "harness", "side_effect": "read"},
+        ),
         CapabilityDescriptor(
             capability_id="builtin.discovery.search",
             name="capability_search",

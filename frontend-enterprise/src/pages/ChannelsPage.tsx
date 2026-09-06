@@ -5,18 +5,29 @@ import { notify } from '@/components/ui/app-toast';
 import AppHeader from '@/components/AppHeader';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { DataTable, type DataTableColumn } from '@/components/DataTable';
+import SearchableSelect from '@/components/SearchableSelect';
 import {
   Checkbox,
   Dialog,
   DialogContent,
   DialogTitle,
+  Input,
   RadioGroup,
   RadioGroupItem,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
   Switch,
 } from '@/components/ui';
 import { Button as UIButton } from '@/components/ui/button';
 
 import { api, TENANT_ID } from '../api/client';
+
+const _CHANNEL_LABELS: Record<string, string> = { feishu: '飞书', dingtalk: '钉钉', wecom: '企业微信', wechat: '微信', web: '网页端' };
+// 渠道转接通知运行时已支持飞书/企微私聊;钉钉/微信适配器只能回会话内消息,不在此列。
+const HANDOFF_NOTIFY_CHANNELS = new Set(['feishu', 'wecom']);
 import IconAdd from '../assets/icons/add.svg?react';
 import IconAlignJustify from '../assets/icons/align-justify.svg?react';
 import IconChat from '../assets/icons/chat.svg?react';
@@ -44,11 +55,20 @@ import type {
   PagedResponse,
   TeamRead,
 } from '../types';
+import { formatHandoffAssigneeValue, parseHandoffAssigneeValue } from '../lib/handoff-assignee';
+import { feishuAppIdFromIdentityScope } from '../lib/identity-scope';
 import WechatSetup from './channels/WechatSetup';
 import WecomSetup from './channels/WecomSetup';
 import FeishuSetup from './channels/FeishuSetup';
 import DingTalkSetup from './channels/DingTalkSetup';
-import { getChannelPresentation } from './channelPresentation';
+import WechatKfSetup from './channels/WechatKfSetup';
+import BindingManagers from './channels/BindingManagers';
+import {
+  canDeleteBinding,
+  canManageBinding,
+  getChannelPresentation,
+  ROLE_LABEL,
+} from './channelPresentation';
 import { StatusBadge } from './scheduled-tasks/StatusBadge';
 import { formatTime, type BadgeTone } from './scheduled-tasks/shared';
 
@@ -84,6 +104,16 @@ const CHANNEL_COMMANDS: Array<{ command: string; description: string }> = [
   { command: '/当前', description: '查看当前员工' },
   { command: '/帮助', description: '查看指令说明' },
 ];
+
+const BINDING_NAME_MAX_LENGTH = 50;
+
+// 接入默认名:渠道名 + YYYYMMDDHHMM,如「飞书202608250910」
+function defaultBindingName(channelLabel: string): string {
+  const now = new Date();
+  const pad = (value: number) => String(value).padStart(2, '0');
+  const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}${pad(now.getHours())}${pad(now.getMinutes())}`;
+  return `${channelLabel}${stamp}`;
+}
 
 function messageDisplay(
   msg: ChannelConversationMessageRead,
@@ -228,16 +258,22 @@ export default function ChannelsPage({
   const [channelMetas, setChannelMetas] = useState<ChannelMetaRead[]>([]);
   const [metasLoaded, setMetasLoaded] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
-  const [createStep, setCreateStep] = useState<'channel' | 'agent'>('channel');
+  const [createStep, setCreateStep] = useState<'channel' | 'name' | 'agent'>('channel');
   const [createChannel, setCreateChannel] = useState('wechat');
+  const [createName, setCreateName] = useState('');
   const [createTarget, setCreateTarget] = useState<'agent' | 'team'>('agent');
   const [createAgentId, setCreateAgentId] = useState('');
   const [createTeamId, setCreateTeamId] = useState('');
   const [teams, setTeams] = useState<TeamRead[]>([]);
   const [teamsLoading, setTeamsLoading] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [renameTargetId, setRenameTargetId] = useState('');
+  const [renameValue, setRenameValue] = useState('');
+  const [renaming, setRenaming] = useState(false);
   const [unbindOpen, setUnbindOpen] = useState(false);
   const [unbinding, setUnbinding] = useState(false);
+  const [togglingStatus, setTogglingStatus] = useState(false);
   const [agentEditing, setAgentEditing] = useState(false);
   const [agentCandidates, setAgentCandidates] = useState<AgentProfileRead[]>([]);
   const [candidatesLoading, setCandidatesLoading] = useState(false);
@@ -245,10 +281,15 @@ export default function ChannelsPage({
   const [defaultAgentId, setDefaultAgentId] = useState('');
   const [savingAgents, setSavingAgents] = useState(false);
   const [autoRouteSaving, setAutoRouteSaving] = useState(false);
+  const [tenantUsers, setTenantUsers] = useState<Array<{ id: string; username: string; display_name?: string; source?: string; channel_identities?: Array<{ channel: string; display_name?: string; external_user_id?: string; external_account_scope?: string }> }>>([]);
+  const [handoffAssigneeSaving, setHandoffAssigneeSaving] = useState(false);
   const [bindCode, setBindCode] = useState<ChannelBindCodeRead | null>(null);
   const [bindCodeOpen, setBindCodeOpen] = useState(false);
   const [bindCodeLoading, setBindCodeLoading] = useState(false);
   const [bindCodeRemain, setBindCodeRemain] = useState(0);
+  const [bindCodeTargetName, setBindCodeTargetName] = useState('');
+  const [bindCodeTargetUserId, setBindCodeTargetUserId] = useState<string | undefined>();
+  const [identityInviteUserId, setIdentityInviteUserId] = useState('');
   const [identityBindings, setIdentityBindings] = useState<ChannelIdentityBindingRead[]>([]);
   const [unbindIdentityTarget, setUnbindIdentityTarget] =
     useState<ChannelIdentityBindingRead | null>(null);
@@ -256,7 +297,38 @@ export default function ChannelsPage({
 
   const binding = bindings.find((item) => item.id === selectedId) || null;
   const navigate = useNavigate();
-  const channelIdentities = identityBindings.filter((item) => item.channel === binding?.channel);
+  // 身份绑定属于具体渠道账号 scope；同一用户可以分别绑定多个飞书应用。
+  const channelIdentities = identityBindings.filter(
+    (item) =>
+      item.channel === binding?.channel &&
+      (item.external_account_scope || '') === (binding?.identity_scope_key || ''),
+  );
+  const bindingScope = binding?.identity_scope_key || '';
+  // 已绑定集合只统计内部成员:渠道懒建账号(外部客户)自带指向自己的身份,
+  // 不应计入"邀请成员绑定"的绑定状态。展示与邀请下拉都排除当前用户——
+  // 自己的绑定在上方"身份绑定"区有专门入口(绑定/解绑),避免同一人出现两次。
+  const identityBoundInternalUserIds = new Set(
+    tenantUsers
+      .filter(
+        (user) =>
+          (!user.source || user.source === 'web') &&
+          user.channel_identities?.some(
+            (identity) =>
+              identity.channel === binding?.channel &&
+              (identity.external_account_scope || '') === bindingScope,
+          ),
+      )
+      .map((user) => user.id),
+  );
+  const identityBoundUsers = tenantUsers.filter(
+    (user) => identityBoundInternalUserIds.has(user.id) && user.id !== currentUser?.id,
+  );
+  const identityUnboundUsers = tenantUsers.filter(
+    (user) =>
+      (!user.source || user.source === 'web') &&
+      user.id !== currentUser?.id &&
+      !identityBoundInternalUserIds.has(user.id),
+  );
   const bindCodeChannelName = binding
     ? channelName(binding.channel)
     : getChannelPresentation(createChannel).name;
@@ -268,6 +340,17 @@ export default function ChannelsPage({
 
   function ifStale(snapshot: string): boolean {
     return snapshot !== selectedIdRef.current;
+  }
+
+  async function loadTenantUsers() {
+    try {
+      const rows = await api.get<Array<{ id: string; username: string; display_name?: string; source?: string; channel_identities?: Array<{ channel: string; display_name?: string; external_user_id?: string; external_account_scope?: string }> }>>(
+        `/api/auth/users?tenant_id=${TENANT_ID}&include_channel=true`,
+      );
+      setTenantUsers(rows);
+    } catch {
+      setTenantUsers([]);
+    }
   }
 
   useEffect(() => {
@@ -289,6 +372,7 @@ export default function ChannelsPage({
     void loadIdentityBindings();
     void loadChannelMetas();
     void loadTeams();
+    void loadTenantUsers();
   }, []);
 
   useEffect(() => {
@@ -365,6 +449,10 @@ export default function ChannelsPage({
     const scope = identity.external_account_scope || '';
     if (!scope) return channelName(identity.channel);
     if (binding?.corp_id && scope === binding.corp_id) return `企业： ${scope}`;
+    // 飞书 scope 是"app:{长度}:{appId}:tenant:{长度}:{tenantKey}"技术键,
+    // 解析出 appId 展示,避免把整段内部键暴露给用户。
+    const feishuAppId = feishuAppIdFromIdentityScope(scope);
+    if (feishuAppId) return `飞书应用： ${feishuAppId}`;
     return `Bot: ${scope}`;
   }
 
@@ -482,6 +570,7 @@ export default function ChannelsPage({
   function openCreate() {
     setCreateStep('channel');
     setCreateChannel(channelMetas[0]?.channel || 'wechat');
+    setCreateName('');
     setCreateTarget('agent');
     setCreateAgentId('');
     setCreateTeamId('');
@@ -501,11 +590,13 @@ export default function ChannelsPage({
         // agent_id 与 team_id 互斥，后端二选一
         ...(agentId ? { agent_id: agentId } : { team_id: teamId }),
         channel: createChannel,
+        name: createName.trim(),
       });
       notify.success('渠道接入创建成功');
       setCreateOpen(false);
       setCreateAgentId('');
       setCreateTeamId('');
+      setCreateName('');
       await load();
       setSelectedId(created.id);
     } catch (error) {
@@ -515,14 +606,56 @@ export default function ChannelsPage({
     }
   }
 
-  async function openBindCode() {
+  function openRename(item: ChannelBindingRead) {
+    setRenameTargetId(item.id);
+    setRenameValue(item.name?.trim() || channelName(item.channel));
+    setRenameOpen(true);
+  }
+
+  async function confirmRename() {
+    const target = bindings.find((item) => item.id === renameTargetId);
+    if (!target || renaming) return;
+    const name = renameValue.trim();
+    if (!name) {
+      notify.error('接入名称不能为空');
+      return;
+    }
+    setRenaming(true);
+    try {
+      const updated = await api.put<ChannelBindingRead>(
+        `/api/enterprise/channels/${target.id}?tenant_id=${TENANT_ID}`,
+        { tenant_id: TENANT_ID, name },
+      );
+      setBindings((current) =>
+        current.map((item) => (item.id === updated.id ? updated : item)),
+      );
+      setRenameOpen(false);
+      notify.success('重命名成功');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '重命名失败');
+    } finally {
+      setRenaming(false);
+    }
+  }
+
+  async function openBindCode(targetUserId?: string) {
     if (bindCodeLoading) return;
     setBindCodeLoading(true);
     try {
-      const result = await api.post<ChannelBindCodeRead>(
-        `/api/enterprise/channels/bind-code?tenant_id=${TENANT_ID}`,
-      );
+      const target = targetUserId
+        ? tenantUsers.find((user) => user.id === targetUserId)
+        : currentUser;
+      const result = targetUserId && binding
+        ? await api.post<ChannelBindCodeRead>(
+            `/api/enterprise/channels/${binding.id}/identity-bind-code?tenant_id=${TENANT_ID}`,
+            { user_id: targetUserId },
+          )
+        : await api.post<ChannelBindCodeRead>(
+            `/api/enterprise/channels/bind-code?tenant_id=${TENANT_ID}`,
+          );
       setBindCode(result);
+      setBindCodeTargetName(target?.display_name || target?.username || '当前用户');
+      setBindCodeTargetUserId(targetUserId);
       setBindCodeOpen(true);
     } catch (error) {
       notify.error(error instanceof Error ? error.message : '生成绑定码失败');
@@ -555,6 +688,22 @@ export default function ChannelsPage({
       notify.error(error instanceof Error ? error.message : '断开接入失败');
     } finally {
       setUnbinding(false);
+    }
+  }
+
+  async function toggleStatus() {
+    if (!binding) return;
+    setTogglingStatus(true);
+    try {
+      const updated = await api.post<ChannelBindingRead>(
+        `/api/enterprise/channels/${binding.id}/toggle-status?tenant_id=${TENANT_ID}`,
+      );
+      setBindings((current) => current.map((item) => (item.id === updated.id ? updated : item)));
+      notify.success(updated.status === 'active' ? '已启用渠道' : '已停用渠道');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '切换状态失败');
+    } finally {
+      setTogglingStatus(false);
     }
   }
 
@@ -626,12 +775,47 @@ export default function ChannelsPage({
     }
   }
 
+  async function saveHandoffAssignee(value: string) {
+    if (!binding || handoffAssigneeSaving) return;
+    const { userId, channel } = parseHandoffAssigneeValue(value === '__none__' ? '' : value);
+    setHandoffAssigneeSaving(true);
+    try {
+      const updated = await api.put<ChannelBindingRead>(
+        `/api/enterprise/channels/${binding.id}?tenant_id=${TENANT_ID}`,
+        {
+          tenant_id: TENANT_ID,
+          default_handoff_assignee_user_id: userId || null,
+          default_handoff_assignee_channel: userId ? channel : null,
+        },
+      );
+      setBindings((current) =>
+        current.map((item) => (item.id === updated.id ? updated : item)),
+      );
+      notify.success('已保存');
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '保存默认人工处理人失败');
+    } finally {
+      setHandoffAssigneeSaving(false);
+    }
+  }
+
   function metaFor(channel: string): ChannelMetaRead | undefined {
     return channelMetas.find((item) => item.channel === channel);
   }
 
   function channelName(channel: string): string {
     return getChannelPresentation(channel, metaFor(channel)?.name).name;
+  }
+
+  function bindingDisplayName(item: ChannelBindingRead): string {
+    return item.name?.trim() || channelName(item.channel);
+  }
+
+  function channelTypeTag(item: ChannelBindingRead): string | null {
+    const name = item.name?.trim();
+    // 未命名或改回渠道类型名时不重复展示
+    if (!name || name === channelName(item.channel)) return null;
+    return channelName(item.channel);
   }
 
   function setupKindFor(channel: string): string {
@@ -656,7 +840,7 @@ export default function ChannelsPage({
     ? getChannelPresentation(binding.channel, metaFor(binding.channel)?.name)
     : null;
   // bot_id / ilink_bot_id 是 DTO 顶层字段(后端不回传 config_json)
-  const botId = binding?.ilink_bot_id || binding?.bot_id || binding?.app_id || '';
+  const botId = binding?.ilink_bot_id || binding?.bot_id || binding?.open_kfid || binding?.app_id || '';
   const mountedAgents = binding?.agents || [];
   const conversationGroups = groupByDay(conversations, (item) => item.updated_at);
 
@@ -702,7 +886,7 @@ export default function ChannelsPage({
             >
               <IconWarningFill className="size-[14px] shrink-0 text-[#f59e0b]" />
               <span>
-                {channelName(item.channel)}：{attentionText(item)}
+                {bindingDisplayName(item)}：{attentionText(item)}
               </span>
             </button>
           ))}
@@ -745,8 +929,13 @@ export default function ChannelsPage({
                 <div className="flex flex-wrap items-center gap-[10px]">
                   <IconChat className="size-[16px] shrink-0" />
                   <span className="text-[14px] font-semibold text-[#18181a]">
-                    {channelName(item.channel)}
+                    {bindingDisplayName(item)}
                   </span>
+                  {channelTypeTag(item) && (
+                    <span className="rounded-[6px] bg-[#f0f1f5] px-[6px] py-[2px] text-[11px] text-[#858b9c]">
+                      {channelTypeTag(item)}
+                    </span>
+                  )}
                   <StatusBadge tone={status?.tone || 'gray'}>
                     {status?.text || item.status}
                   </StatusBadge>
@@ -754,6 +943,19 @@ export default function ChannelsPage({
                     <span className="text-[12px] text-[#858b9c]">
                       {item.connected ? '已连接' : isSessionRecovering(item) ? '恢复中' : '未连接'}
                     </span>
+                  )}
+                  {canManageBinding(item) && (
+                    <UIButton
+                      variant="outline"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        openRename(item);
+                      }}
+                      onKeyDown={(event) => event.stopPropagation()}
+                      className="ml-auto h-[26px] gap-1 rounded-[8px] border-[#e3e7f1] px-[12px] text-[11px] font-normal text-[#464c5e] hover:bg-[#f6f6f6] hover:text-[#18181a]"
+                    >
+                      重命名
+                    </UIButton>
                   )}
                 </div>
                 <div className="flex flex-wrap items-center gap-[10px] text-[12px] text-[#858b9c]">
@@ -805,8 +1007,13 @@ export default function ChannelsPage({
           <div className="flex min-w-0 items-center gap-[10px]">
             <IconChat className="size-[16px] shrink-0" />
             <span className="text-[14px] font-semibold text-[#18181a]">
-              {channelName(binding.channel)}
+              {bindingDisplayName(binding)}
             </span>
+            {channelTypeTag(binding) && (
+              <span className="rounded-[6px] bg-[#f0f1f5] px-[6px] py-[2px] text-[11px] text-[#858b9c]">
+                {channelTypeTag(binding)}
+              </span>
+            )}
             <StatusBadge tone={bindingStatus?.tone || 'gray'}>
               {bindingStatus?.text || binding.status}
             </StatusBadge>
@@ -823,21 +1030,58 @@ export default function ChannelsPage({
             <span className="truncate text-[12px] text-[#858b9c]">
               创建者：{binding.created_by_name || '-'}
             </span>
+            {binding.my_role && (
+              <span className="rounded-[6px] bg-[#f0f1f5] px-[6px] py-[2px] text-[11px] text-[#858b9c]">
+                {ROLE_LABEL[binding.my_role] || binding.my_role}
+              </span>
+            )}
           </div>
           <div className="flex items-center gap-[8px]">
-            <UIButton
-              variant="outline"
-              onClick={() => setUnbindOpen(true)}
-              className={OUTLINE_BUTTON_CLASS}
-            >
-              断开接入
-            </UIButton>
+            {canManageBinding(binding) && (
+              <UIButton
+                variant="outline"
+                onClick={() => openRename(binding)}
+                className={OUTLINE_BUTTON_CLASS}
+              >
+                重命名
+              </UIButton>
+            )}
+            {canManageBinding(binding) && (
+              <UIButton
+                variant="outline"
+                onClick={() => void toggleStatus()}
+                disabled={togglingStatus}
+                className={OUTLINE_BUTTON_CLASS}
+              >
+                {binding.status === 'active' ? '停用' : '启用'}
+              </UIButton>
+            )}
+            {canDeleteBinding(binding) && (
+              <UIButton
+                variant="outline"
+                onClick={() => setUnbindOpen(true)}
+                className={OUTLINE_BUTTON_CLASS}
+              >
+                断开接入
+              </UIButton>
+            )}
           </div>
         </div>
         {binding.status === 'expired' && setupKindFor(binding.channel) !== 'qrcode' && (
           <span className="text-[12px] text-[#d20b0b]">当前未连接，请检查凭证或网络</span>
         )}
-        {binding.channel === 'feishu' ? (
+        {binding.channel === 'wechat_kf' ? (
+          <WechatKfSetup
+            key={binding.id}
+            binding={binding}
+            meta={metaFor(binding.channel)}
+            onChanged={(updated) =>
+              setBindings((current) =>
+                current.map((item) => (item.id === updated.id ? updated : item)),
+              )
+            }
+          />
+        ) : binding.channel === 'feishu' ? (
           <FeishuSetup
             key={binding.id}
             binding={binding}
@@ -882,6 +1126,76 @@ export default function ChannelsPage({
             onCheckedChange={(next) => void toggleAutoRoute(next)}
           />
         </div>
+        <div className="flex items-center justify-between gap-[12px] border-t border-[#eef0f4] pt-[16px]">
+          <div className="flex min-w-0 flex-col gap-[4px]">
+            <span className="text-[13px] font-semibold text-[#18181a]">默认人工处理人</span>
+            <span className="text-[12px] leading-[1.6] text-[#858b9c]">
+              SOP 人工节点未指定处理人时，转交给此用户；选择带渠道标注的选项会通过对应渠道转接（当前支持飞书/企业微信）。未配置时回退到数字员工负责人或管理员。
+            </span>
+          </div>
+          <div className="flex items-center gap-[8px]">
+            {binding.default_handoff_assignee_name && (
+              <span className="text-[12px] text-[#858b9c]">
+                当前：{binding.default_handoff_assignee_name}
+                {`（${_CHANNEL_LABELS[binding.default_handoff_assignee_channel || 'web'] || _CHANNEL_LABELS.web}）`}
+              </span>
+            )}
+            <Select
+              value={
+                binding.default_handoff_assignee_user_id
+                  ? formatHandoffAssigneeValue(
+                    binding.default_handoff_assignee_user_id,
+                    binding.default_handoff_assignee_channel,
+                  )
+                  : '__none__'
+              }
+              disabled={handoffAssigneeSaving}
+              onValueChange={(value) => void saveHandoffAssignee(value)}
+            >
+              <SelectTrigger className="h-[32px] w-[160px] text-[12px]">
+                <SelectValue placeholder="选择处理人" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="__none__">未配置</SelectItem>
+                {tenantUsers.filter((user) => !user.source || user.source === 'web').flatMap((user) => {
+                  const name = user.display_name || user.username || user.id;
+                  // 渠道转接通知运行时已支持飞书/企微私聊,渠道标注选项对支持
+                  // 私聊通知的绑定渠道生成(后端同样拒绝其他渠道)。
+                  const channelVariantAvailable = HANDOFF_NOTIFY_CHANNELS.has(binding.channel);
+                  const scope = binding.identity_scope_key || '';
+                  const matchingIdentity = user.channel_identities?.find(
+                    (ci) => ci.channel === binding.channel && (ci.external_account_scope || '') === scope,
+                  );
+                  const items = [
+                    <SelectItem key={user.id} value={user.id}>
+                      {`${name}（${_CHANNEL_LABELS.web}）`}
+                    </SelectItem>,
+                  ];
+                  const channelVariantConfigured = (
+                    binding.default_handoff_assignee_user_id === user.id
+                    && binding.default_handoff_assignee_channel === binding.channel
+                  );
+                  if (channelVariantAvailable && (matchingIdentity || channelVariantConfigured)) {
+                    const channelLabel = _CHANNEL_LABELS[binding.channel] || binding.channel;
+                    items.push(
+                      <SelectItem key={`${user.id}::${binding.channel}`} value={`${user.id}::${binding.channel}`}>
+                        {`${name}（${channelLabel}）`}
+                      </SelectItem>,
+                    );
+                  }
+                  return items;
+                })}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+        {canDeleteBinding(binding) && (
+          <BindingManagers
+            bindingId={binding.id}
+            users={tenantUsers}
+            creatorUserId={binding.created_by_user_id}
+          />
+        )}
       </div>
 
       <section aria-label={activeChannel ? `${activeChannel.name}身份绑定` : '身份绑定'}>
@@ -923,6 +1237,51 @@ export default function ChannelsPage({
               >
                 {`绑定我的${channelName(binding.channel)}`}
               </UIButton>
+            </div>
+          )}
+          {canManageBinding(binding) && binding.channel === 'feishu' && (
+            <div className="mt-[4px] flex flex-col gap-[10px] border-t border-[#eef0f4] pt-[12px]">
+              <div className="flex flex-col gap-[3px]">
+                <span className="text-[12px] font-medium text-[#18181a]">邀请成员绑定飞书身份</span>
+                <span className="text-[11px] leading-[1.6] text-[#858b9c]">
+                  每位成员需用自己的飞书账号向当前机器人发送一次性绑定指令。
+                </span>
+              </div>
+              {identityBoundUsers.length > 0 && (
+                <div className="flex flex-wrap gap-[6px]">
+                  {identityBoundUsers.map((user) => (
+                    <StatusBadge key={user.id} tone="green">
+                      {`${user.display_name || user.username} 已绑定`}
+                    </StatusBadge>
+                  ))}
+                </div>
+              )}
+              {identityUnboundUsers.length > 0 ? (
+                <div className="flex flex-wrap items-center gap-[8px]">
+                  <SearchableSelect
+                    value={identityInviteUserId}
+                    onValueChange={setIdentityInviteUserId}
+                    options={identityUnboundUsers.map((user) => ({
+                      value: user.id,
+                      label: user.display_name || user.username || user.id,
+                      keywords: [user.username],
+                    }))}
+                    placeholder="选择内部成员"
+                    searchPlaceholder="搜索成员"
+                    emptyText="无匹配成员"
+                  />
+                  <UIButton
+                    variant="outline"
+                    disabled={!identityInviteUserId || bindCodeLoading}
+                    onClick={() => void openBindCode(identityInviteUserId)}
+                    className={OUTLINE_BUTTON_CLASS}
+                  >
+                    生成绑定指令
+                  </UIButton>
+                </div>
+              ) : (
+                <span className="text-[11px] text-[#858b9c]">所有内部成员均已绑定当前飞书应用</span>
+              )}
             </div>
           )}
         </div>
@@ -1254,7 +1613,11 @@ export default function ChannelsPage({
           className="flex max-h-[calc(100dvh-4rem)] w-[calc(100%-2rem)] flex-col gap-[16px] overflow-hidden rounded-[14px] px-[20px] py-[16px] sm:max-w-[480px]"
         >
           <DialogTitle className="text-[14px] font-normal leading-none text-[#757f9c]">
-            {createStep === 'channel' ? '选择渠道' : '选择绑定对象'}
+            {createStep === 'channel'
+              ? '选择渠道'
+              : createStep === 'name'
+                ? '命名接入'
+                : '选择绑定对象'}
           </DialogTitle>
           <div className="min-h-0 flex-1 overflow-y-auto">
             {createStep === 'channel' ? (
@@ -1271,13 +1634,23 @@ export default function ChannelsPage({
                       tabIndex={0}
                       onClick={() => {
                         setCreateChannel(meta.channel);
-                        setCreateStep('agent');
+                        setCreateName(
+                          defaultBindingName(
+                            getChannelPresentation(meta.channel, meta.name).name,
+                          ),
+                        );
+                        setCreateStep('name');
                       }}
                       onKeyDown={(event) => {
                         if (event.key === 'Enter' || event.key === ' ') {
                           event.preventDefault();
                           setCreateChannel(meta.channel);
-                          setCreateStep('agent');
+                          setCreateName(
+                            defaultBindingName(
+                              getChannelPresentation(meta.channel, meta.name).name,
+                            ),
+                          );
+                          setCreateStep('name');
                         }
                       }}
                       className="flex cursor-pointer flex-col gap-[6px] rounded-[14px] border border-[#eef0f4] p-[16px] transition-colors hover:border-[#cbd3e6]"
@@ -1294,6 +1667,26 @@ export default function ChannelsPage({
                   ))}
                 </div>
               )
+            ) : createStep === 'name' ? (
+              <div className="flex flex-col gap-[12px]">
+                <label className="flex flex-col gap-[6px] text-[12px] text-[#464c5e]">
+                  接入名称
+                  <Input
+                    type="text"
+                    value={createName}
+                    maxLength={BINDING_NAME_MAX_LENGTH}
+                    autoComplete="off"
+                    data-1p-ignore="true"
+                    data-lpignore="true"
+                    placeholder="请输入接入名称"
+                    onChange={(event) => setCreateName(event.target.value)}
+                    className="h-8 rounded-[10px] text-[12px]"
+                  />
+                </label>
+                <span className="text-[11px] leading-[1.6] text-[#858b9c]">
+                  默认按渠道名与时间生成，可自行修改。
+                </span>
+              </div>
             ) : (
               <div className="flex flex-col gap-[12px]">
                 <div className="flex rounded-[10px] bg-[#f2f3f7] p-[4px]">
@@ -1387,13 +1780,13 @@ export default function ChannelsPage({
             )}
           </div>
           <div className="flex justify-end gap-[8px]">
-            {createStep === 'agent' && (
+            {createStep !== 'channel' && (
               <UIButton
                 variant="outline"
-                onClick={() => setCreateStep('channel')}
+                onClick={() => setCreateStep(createStep === 'agent' ? 'name' : 'channel')}
                 className={OUTLINE_BUTTON_CLASS}
               >
-                返回选择渠道
+                {createStep === 'agent' ? '返回命名' : '返回选择渠道'}
               </UIButton>
             )}
             <UIButton
@@ -1403,6 +1796,15 @@ export default function ChannelsPage({
             >
               取消
             </UIButton>
+            {createStep === 'name' && (
+              <UIButton
+                onClick={() => setCreateStep('agent')}
+                disabled={!createName.trim()}
+                className={PRIMARY_BUTTON_CLASS}
+              >
+                下一步
+              </UIButton>
+            )}
             {createStep === 'agent' && (
               <UIButton
                 onClick={() => void createBinding()}
@@ -1418,11 +1820,56 @@ export default function ChannelsPage({
         </DialogContent>
       </Dialog>
 
+      <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
+        <DialogContent
+          aria-describedby={undefined}
+          className="flex w-[calc(100%-2rem)] flex-col gap-[16px] overflow-hidden rounded-[14px] px-[20px] py-[16px] sm:max-w-[420px]"
+        >
+          <DialogTitle className="text-[14px] font-normal leading-none text-[#757f9c]">
+            重命名接入
+          </DialogTitle>
+          <label className="flex flex-col gap-[6px] text-[12px] text-[#464c5e]">
+            接入名称
+            <Input
+              type="text"
+              value={renameValue}
+              maxLength={BINDING_NAME_MAX_LENGTH}
+              autoComplete="off"
+              data-1p-ignore="true"
+              data-lpignore="true"
+              placeholder="请输入接入名称"
+              onChange={(event) => setRenameValue(event.target.value)}
+              className="h-8 rounded-[10px] text-[12px]"
+            />
+          </label>
+          <div className="flex justify-end gap-[8px]">
+            <UIButton
+              variant="outline"
+              onClick={() => setRenameOpen(false)}
+              className={OUTLINE_BUTTON_CLASS}
+            >
+              取消
+            </UIButton>
+            <UIButton
+              onClick={() => void confirmRename()}
+              disabled={!renameValue.trim() || renaming}
+              className={PRIMARY_BUTTON_CLASS}
+            >
+              保存
+            </UIButton>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       <Dialog
         open={bindCodeOpen}
         onOpenChange={(open) => {
           setBindCodeOpen(open);
-          if (!open) void loadIdentityBindings();
+          if (!open) {
+            void loadIdentityBindings();
+            void loadTenantUsers();
+            void load();
+          }
         }}
       >
         <DialogContent
@@ -1430,7 +1877,7 @@ export default function ChannelsPage({
           className="flex w-[calc(100%-2rem)] flex-col gap-[16px] overflow-hidden rounded-[14px] px-[20px] py-[16px] sm:max-w-[420px]"
         >
           <DialogTitle className="text-[14px] font-normal leading-none text-[#757f9c]">
-            {`绑定我的${bindCodeChannelName}`}
+            {`绑定${bindCodeTargetName ? ` ${bindCodeTargetName} 的` : ''}${bindCodeChannelName}身份`}
           </DialogTitle>
           {bindCode && (
             <div className="flex flex-col items-center gap-[12px]">
@@ -1453,11 +1900,11 @@ export default function ChannelsPage({
                 </UIButton>
               </div>
               <span className="text-center text-[12px] leading-[1.6] text-[#858b9c]">
-                {`请在${bindCodeChannelName}中向你的数字员工发送以上指令，完成身份绑定。`}
+                {`请让${bindCodeTargetName || '该成员'}使用自己的${bindCodeChannelName}账号向当前机器人发送以上指令。`}
               </span>
               {bindCodeRemain === 0 && (
                 <UIButton
-                  onClick={() => void openBindCode()}
+                  onClick={() => void openBindCode(bindCodeTargetUserId)}
                   disabled={bindCodeLoading}
                   className={PRIMARY_BUTTON_CLASS}
                 >

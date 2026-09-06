@@ -27,15 +27,22 @@ from app.harness.contracts import (
 from app.harness.errors import HarnessExecutionError
 from app.harness.executor import HarnessExecutor
 from app.harness.filesystem import (
+    ExtractDocumentTextArguments,
     PublishArtifactArguments,
     build_file_tool_registry,
     publish_artifact,
     register_file_tools,
 )
 from app.harness.registry import HarnessRegistry
+from app.harness.skill_script import (
+    RunSkillScriptArguments,
+    register_skill_script_tools,
+    run_skill_script,
+)
 
 __all__ = [
     "ExecCommandArguments",
+    "ExtractDocumentTextArguments",
     "HarnessArtifactAccessError",
     "HarnessWorkspaceSnapshot",
     "HarnessExecutionError",
@@ -49,6 +56,7 @@ __all__ = [
     "HarnessToolSpec",
     "OpenedHarnessArtifact",
     "PublishArtifactArguments",
+    "RunSkillScriptArguments",
     "build_command_tool_registry",
     "build_file_tool_registry",
     "exec_command",
@@ -60,6 +68,8 @@ __all__ = [
     "publish_harness_artifacts",
     "register_command_tools",
     "register_file_tools",
+    "register_skill_script_tools",
+    "run_skill_script",
     "run_sandboxed_process",
     "snapshot_harness_workspace",
 ]

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import timedelta
 
+from sqlalchemy import or_, update
 from sqlmodel import Session, select
 
 from app.channels.service_identity import channel_label
@@ -23,6 +24,7 @@ def help_text(channel: str) -> str:
         "/员工 查看可调度员工列表\n"
         "/切换 <名字> 切换到指定员工\n"
         "/当前 查看当前员工\n"
+        "/回复反馈 <内容> 回复人工转接通知\n"
         f"/绑定 <绑定码> 把{label}账号绑定到你的 StaffDeck 账号\n"
         f"/解绑 解除{label}账号与 StaffDeck 账号的绑定\n"
         "/帮助 查看本说明"
@@ -35,7 +37,7 @@ HELP_TEXT = help_text("wechat")
 
 @dataclass
 class ChannelCommand:
-    kind: str  # list/current/help/switch
+    kind: str  # list/current/help/switch/bind/unbind/handoff_reply
     query: str = ""  # switch 的目标名字(可为空)
 
 
@@ -59,6 +61,9 @@ def parse_command(text: str) -> ChannelCommand | None:
             return ChannelCommand(kind="bind", query=body[len(prefix):].strip())
     if lowered.startswith("切换"):
         return ChannelCommand(kind="switch", query=body[len("切换"):].strip())
+    for prefix in ("回复反馈", "handoff_reply"):
+        if lowered.startswith(prefix):
+            return ChannelCommand(kind="handoff_reply", query=body[len(prefix):].strip())
     if body and " " not in body and "\n" not in body:
         # /<名字> 直达
         return ChannelCommand(kind="switch", query=body)
@@ -66,14 +71,24 @@ def parse_command(text: str) -> ChannelCommand | None:
 
 
 def mounted_agents(db: Session, binding: ChannelBinding) -> list[ChannelBindingAgent]:
-    """挂载集;无挂载行(存量 v1 绑定)回退为 [binding.agent_id] 默认,不依赖回填。"""
+    """挂载集;无挂载行(存量 v1 绑定)回退为 [binding.agent_id] 默认,不依赖回填。
+
+    指向已删除员工的孤儿挂载行直接过滤(删除员工会清理挂载,这里兜底历史数据),
+    避免 /员工 列表出现裸 agent_id、或 /切换 把会话路由到已删除员工。
+    挂载行全部失效时按存量绑定回退。
+    """
     rows = db.exec(
         select(ChannelBindingAgent)
         .where(ChannelBindingAgent.binding_id == binding.id)
         .order_by(ChannelBindingAgent.sort_order, ChannelBindingAgent.created_at)
     ).all()
     if rows:
-        return list(rows)
+        alive_ids = set(
+            agent_names(db, binding.tenant_id, [row.agent_id for row in rows])
+        )
+        mounted = [row for row in rows if row.agent_id in alive_ids]
+        if mounted:
+            return mounted
     return [
         ChannelBindingAgent(
             tenant_id=binding.tenant_id,
@@ -158,6 +173,7 @@ def set_current_agent(
     state = _get_conv_state(db, binding, external_conv_id)
     if state:
         state.current_agent_id = agent_id
+        state.routing_revision += 1
         state.updated_at = utc_now()
         if pin_until is not None:
             state.manual_pin_until = pin_until
@@ -171,6 +187,52 @@ def set_current_agent(
         )
     db.add(state)
     db.flush()
+
+
+def route_revision(
+    db: Session,
+    binding: ChannelBinding,
+    external_conv_id: str,
+) -> tuple[str, int] | None:
+    """Return the current route pointer and its compare-and-set revision."""
+    state = _get_conv_state(db, binding, external_conv_id)
+    if not state:
+        return None
+    return state.current_agent_id, state.routing_revision
+
+
+def compare_and_set_current_agent(
+    db: Session,
+    binding: ChannelBinding,
+    external_conv_id: str,
+    *,
+    expected_agent_id: str,
+    expected_revision: int,
+    agent_id: str,
+) -> bool:
+    """Apply an automatic route only while the inspected route is still current."""
+    now = utc_now()
+    result = db.exec(
+        update(ChannelConvState)
+        .where(
+            ChannelConvState.binding_id == binding.id,
+            ChannelConvState.external_conv_id == external_conv_id,
+            ChannelConvState.current_agent_id == expected_agent_id,
+            ChannelConvState.routing_revision == expected_revision,
+            or_(
+                ChannelConvState.manual_pin_until.is_(None),
+                ChannelConvState.manual_pin_until <= now,
+            ),
+        )
+        .values(
+            current_agent_id=agent_id,
+            routing_revision=ChannelConvState.routing_revision + 1,
+            updated_at=now,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    db.flush()
+    return result.rowcount == 1
 
 
 def manual_pin_active(db: Session, binding: ChannelBinding, external_conv_id: str) -> bool:

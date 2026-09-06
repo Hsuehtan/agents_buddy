@@ -11,6 +11,7 @@ from app.core.context_projection import (
     compact_conversation_context,
     compact_pending_tasks,
 )
+from app.core.graph_rules import GraphRules
 from app.core.task_frame_store import MAX_TASK_FRAMES_PER_TURN
 from app.db.models import ChatSession, ModelConfig, Skill, new_id
 from app.llm import LLMClient, LLMError
@@ -25,6 +26,7 @@ from app.session.session_schema import (
     PlannedTaskFrame,
     RouterDecision,
     TaskUpdate,
+    TeamPlannerContext,
     TurnPlan,
 )
 from app.session.slot_policy import strip_router_generated_message_slots
@@ -48,6 +50,8 @@ class TurnPlanner:
         conversation_context: dict[str, object] | None = None,
         memory_context: list[dict[str, object]] | None = None,
         task_frame_state: list[dict[str, Any]] | None = None,
+        interaction_mode: str = "normal",
+        team_context: TeamPlannerContext | None = None,
     ) -> TurnPlan:
         payload = stage_payload(
             phase="TurnPlanner",
@@ -65,6 +69,10 @@ class TurnPlanner:
                 # make the prompt boundary explicit so the planner cannot
                 # confuse runtime capabilities with SOP routing candidates.
                 "available_sops": [_sop_payload(skill) for skill in available_skills],
+                "interaction_mode": interaction_mode,
+                "team_context": (
+                    team_context.model_dump(mode="json") if team_context is not None else None
+                ),
             },
             output_contract=TURN_PLANNER_OUTPUT_SCHEMA,
         )
@@ -86,6 +94,8 @@ class TurnPlanner:
             session,
             available_skills,
             task_frame_state,
+            interaction_mode,
+            team_context,
         )
 
     def _generate_validated_plan(
@@ -130,6 +140,8 @@ class TurnPlanner:
         session: ChatSession,
         available_skills: list[Skill],
         task_frame_state: list[dict[str, Any]] | None = None,
+        interaction_mode: str = "normal",
+        team_context: TeamPlannerContext | None = None,
     ) -> TurnPlan:
         skills = {skill.skill_id: skill for skill in available_skills}
         known_frames = _known_task_frames(session, task_frame_state)
@@ -238,6 +250,58 @@ class TurnPlanner:
                         source_message=message,
                     )
                 )
+            elif plan.decision == "handoff_human" and active_skill is not None:
+                handoff_step_id = _find_handoff_node_id(
+                    active_skill, session.active_step_id
+                )
+                if handoff_step_id:
+                    frames.append(
+                        PlannedTaskFrame(
+                            task_id=_unique_task_id(None, seen_ids),
+                            kind="sop",
+                            decision="handoff_human",
+                            target_skill_id=active_skill.skill_id,
+                            target_step_id=handoff_step_id,
+                            user_intent=_one_line(plan.user_intent or message),
+                            requirements=_requirements(
+                                [], plan.user_intent or message
+                            ),
+                            source_message=message,
+                        )
+                    )
+                else:
+                    active_conversation = next(
+                        (
+                            item
+                            for item in known_frames.values()
+                            if item.get("active")
+                            and item.get("kind") == "conversation"
+                        ),
+                        None,
+                    )
+                    frames.append(
+                        PlannedTaskFrame(
+                            task_id=(
+                                str(active_conversation.get("task_id"))
+                                if active_conversation
+                                else _unique_task_id(None, seen_ids)
+                            ),
+                            kind="conversation",
+                            decision="handoff_human",
+                            user_intent=_one_line(plan.user_intent or message),
+                            requirements=_requirements(
+                                (
+                                    list(
+                                        active_conversation.get("requirements") or []
+                                    )
+                                    if active_conversation
+                                    else []
+                                ),
+                                plan.user_intent or message,
+                            ),
+                            source_message=message,
+                        )
+                    )
             else:
                 active_conversation = next(
                     (
@@ -280,6 +344,11 @@ class TurnPlanner:
                 if task_id_map.get(task_id, task_id) in valid_ids
                 and task_id_map.get(task_id, task_id) != frame.task_id
             ]
+        frames = _normalize_execution_targets(
+            frames,
+            interaction_mode=interaction_mode,
+            team_context=team_context,
+        )
 
         first = frames[0]
         if plan.decision == "complete_task":
@@ -315,6 +384,65 @@ def _compact_validation_errors(exc: ValidationError) -> list[dict[str, str]]:
             }
         )
     return compact
+
+
+def _normalize_execution_targets(
+    frames: list[PlannedTaskFrame],
+    *,
+    interaction_mode: str,
+    team_context: TeamPlannerContext | None,
+) -> list[PlannedTaskFrame]:
+    """Validate planner-selected assignees without guessing team membership."""
+    leader_id = team_context.leader_agent_id if team_context is not None else ""
+    member_ids = {
+        member.agent_id
+        for member in (team_context.members if team_context is not None else [])
+        if member.agent_id and member.agent_id != leader_id
+    }
+    for frame in frames:
+        assignee_id = str(frame.assignee_agent_id or "").strip()
+        is_valid_remote = (
+            interaction_mode == "team_tl"
+            and team_context is not None
+            and frame.kind == "conversation"
+            and frame.execution_target == "team_member"
+            and assignee_id in member_ids
+        )
+        if is_valid_remote:
+            frame.execution_target = "team_member"
+            frame.assignee_agent_id = assignee_id
+        else:
+            frame.execution_target = "self"
+            frame.assignee_agent_id = None
+            frame.activation_condition = {}
+
+    # A TeamTask can depend only on other TeamTasks published in this batch.
+    # If a model points a remote frame at a leader-local frame, keep it local
+    # rather than creating a permanently blocked task with an unresolvable ID.
+    while True:
+        remote_ids = {
+            frame.task_id
+            for frame in frames
+            if frame.execution_target == "team_member" and frame.task_id
+        }
+        changed = False
+        for frame in frames:
+            if frame.execution_target != "team_member":
+                continue
+            if any(task_id not in remote_ids for task_id in frame.depends_on_task_ids):
+                frame.execution_target = "self"
+                frame.assignee_agent_id = None
+                frame.activation_condition = {}
+                changed = True
+        if not changed:
+            break
+
+    for frame in frames:
+        if frame.execution_target != "team_member" or not frame.depends_on_task_ids:
+            frame.activation_condition = {}
+        elif not frame.activation_condition:
+            frame.activation_condition = {"type": "all_succeeded"}
+    return frames
 
 
 def turn_plan_router_decision(plan: TurnPlan) -> RouterDecision:
@@ -370,6 +498,18 @@ def _first_node_id(skill: Skill) -> str | None:
             if node_id:
                 return node_id
     return None
+
+
+def _find_handoff_node_id(
+    skill: Skill, active_step_id: str | None = None
+) -> str | None:
+    """查找 SOP 中从当前节点可达的 handoff 节点。
+
+    使用 GraphRules.find_handoff_node_id 做基于 edges 的 BFS,
+    优先返回从 active_step_id 可达的 handoff 节点,而非数组顺序的第一个。
+    """
+    content = skill.content_json or {}
+    return GraphRules.find_handoff_node_id(content, active_step_id)
 
 
 def _known_task_frames(

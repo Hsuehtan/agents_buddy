@@ -7,6 +7,7 @@ import queue
 import re
 import threading
 import time
+import uuid
 import zipfile
 from collections.abc import Callable, Iterator
 from html import unescape
@@ -37,8 +38,19 @@ from app.capabilities.local_general_skill import (
     local_runtime_snapshot,
 )
 from app.capability_scope import normalize_capability_scope
-from app.db import get_session
-from app.db.models import AgentResourceBinding, GeneralSkill, ModelConfig, User, utc_now
+from app.core import AgentLoop
+from app.db import engine, get_session
+from app.db.models import (
+    AgentEvent,
+    AgentResourceBinding,
+    ChatSession,
+    GeneralSkill,
+    Message,
+    ModelConfig,
+    User,
+    new_id,
+    utc_now,
+)
 from app.general_skills import (
     GeneralSkillClawHubImportRequest,
     GeneralSkillImportRequest,
@@ -57,6 +69,7 @@ from app.security.permissions import (
     require_agent_scope_viewer,
 )
 from app.security.tenant import ensure_tenant
+from app.session.session_schema import ChatTurnRequest, ChatTurnResponse
 
 router = APIRouter(
     prefix="/api/enterprise/general-skills",
@@ -68,13 +81,15 @@ MAX_CLAWHUB_PACKAGE_BYTES = 96 * 1024 * 1024
 MAX_CLAWHUB_FILE_BYTES = 2 * 1024 * 1024
 MAX_CLAWHUB_FILES = 240
 REMOTE_SKILL_DOWNLOAD_TIMEOUT_SECONDS = 120
-GENERAL_SKILL_STREAM_IDLE_TIMEOUT_SECONDS = 120
+GENERAL_SKILL_STREAM_IDLE_TIMEOUT_SECONDS = 600
+GENERAL_SKILL_DEBUG_CHANNEL = "skill_test"
 GITHUB_HOSTS = {"github.com", "www.github.com"}
 RAW_GITHUB_HOST = "raw.githubusercontent.com"
 CLAWHUB_HOSTS = {"clawhub.ai", "www.clawhub.ai"}
 SKILLHUB_HOSTS = {"skillhub.ai", "www.skillhub.ai"}
 REMOTE_SKILLHUB_HOSTS = CLAWHUB_HOSTS | SKILLHUB_HOSTS
 CLAWHUB_DOWNLOAD_ENDPOINT = "https://wry-manatee-359.convex.site/api/v1/download"
+LOCAL_REFERENCE_PATTERN = re.compile(r"(?<![\w./-])(?:\./)?references/[^\s`'\"<>|]+")
 
 
 def _agent_id_or_none(agent_id: object | None) -> str | None:
@@ -112,11 +127,6 @@ def import_general_skill(
 ) -> GeneralSkillRead:
     ensure_tenant(db, request.tenant_id)
     files = _normalize_skill_files(request.files, request.markdown)
-    requested_directories = (
-        _skill_directories_from_values(request.directories, files)
-        if request.directories is not None
-        else None
-    )
     markdown = _skill_markdown_from_files(files)
     parsed_metadata = _parse_skill_metadata(markdown)
     metadata = user_creator_metadata(current_user, parsed_metadata)
@@ -140,6 +150,7 @@ def import_general_skill(
     if not is_private_agent_scope:
         ensure_open_gallery_admin(request.tenant_id, current_user)
     row = None
+    package_source_row = None
     inherited_capability_scope = "general"
     if lookup_slug:
         row = db.exec(
@@ -155,12 +166,19 @@ def import_general_skill(
             raise HTTPException(status_code=400, detail="General skill slug cannot be modified")
         if is_private_agent_scope:
             if is_open_gallery_resource(db, request.tenant_id, "general_skill", row):
+                package_source_row = row
                 row = None
                 slug = _unique_slug(db, request.tenant_id, slug)
             elif not _general_skill_editable_by_agent(db, request.tenant_id, agent.id, row):
                 raise HTTPException(
                     status_code=404, detail="General skill not visible to this agent"
                 )
+            elif not _private_skill_owned_by_agent(
+                db, request.tenant_id, row, agent.id
+            ):
+                package_source_row = row
+                row = None
+                slug = _unique_slug(db, request.tenant_id, slug)
     else:
         conflict = db.exec(
             select(GeneralSkill).where(
@@ -184,6 +202,16 @@ def import_general_skill(
                 row = conflict
             else:
                 raise HTTPException(status_code=409, detail="General skill slug already exists")
+    package_source = row or package_source_row
+    if package_source is not None and not request.files and request.markdown is not None:
+        files = _replace_skill_markdown_in_package(package_source, request.markdown)
+        markdown = _skill_markdown_from_files(files)
+    requested_directories = (
+        _skill_directories_from_values(request.directories, files)
+        if request.directories is not None
+        else None
+    )
+    _validate_skill_package_references(files)
     now = utc_now()
     if row:
         metadata = metadata_preserving_creator(row.metadata_json, parsed_metadata)
@@ -262,6 +290,20 @@ def import_general_skill(
             metadata_json=metadata,
             revive=True,
         )
+        if package_source_row is not None and package_source_row.id != row.id:
+            replaced_binding = db.exec(
+                select(AgentResourceBinding).where(
+                    AgentResourceBinding.tenant_id == request.tenant_id,
+                    AgentResourceBinding.agent_id == agent.id,
+                    AgentResourceBinding.resource_type == "general_skill",
+                    AgentResourceBinding.resource_id == package_source_row.id,
+                    AgentResourceBinding.status != "deleted",
+                )
+            ).first()
+            if replaced_binding is not None:
+                replaced_binding.status = "deleted"
+                replaced_binding.updated_at = now
+                db.add(replaced_binding)
     else:
         ensure_open_gallery_binding(
             db,
@@ -367,6 +409,7 @@ def _create_imported_general_skill(
     capability_scope: str = "general",
     current_user: object | None = None,
 ) -> GeneralSkillRead:
+    _validate_skill_package_references(files)
     markdown = _skill_markdown_from_files(files)
     metadata = _parse_skill_metadata(markdown)
     resolved_name = (
@@ -695,30 +738,78 @@ def run_general_skill_stream(
         raise HTTPException(status_code=400, detail="General skill is not published")
     require_agent_scope_viewer(request.tenant_id, request.agent_id, current_user, db)
     _ensure_general_skill_visible(db, request.tenant_id, skill, request.agent_id)
-    model_config = _get_request_model(db, request.tenant_id, request.model_config_id)
     skill_snapshot = _general_skill_snapshot(skill)
-    model_snapshot = model_config
+    # Validate the explicitly selected model before starting a durable Harness
+    # turn. AgentLoop resolves the same config again in its worker session.
+    _get_request_model(db, request.tenant_id, request.model_config_id)
+    if request.operation == "read":
+        model_config = _get_request_model(db, request.tenant_id, request.model_config_id)
+
+        def read_stream_events() -> Iterator[str]:
+            response = _run_general_skill_operation(
+                skill_snapshot,
+                request,
+                model_config,
+                current_user.id,
+            )
+            yield _sse("complete", response.model_dump(mode="json"))
+
+        return StreamingResponse(read_stream_events(), media_type="text/event-stream")
+
+    session_id = new_id("session")
+    client_turn_id = f"skill-test-{uuid.uuid4().hex}"
+    debug_session = ChatSession(
+        id=session_id,
+        tenant_id=request.tenant_id,
+        user_id=current_user.id,
+        agent_id=request.agent_id,
+        title=f"技能测试 · {skill.name}",
+        channel=GENERAL_SKILL_DEBUG_CHANNEL,
+    )
+    db.add(debug_session)
+    db.commit()
+
+    harness_request = ChatTurnRequest(
+        tenant_id=request.tenant_id,
+        session_id=session_id,
+        agent_id=request.agent_id,
+        model_config_id=request.model_config_id,
+        client_turn_id=client_turn_id,
+        user_id=current_user.id,
+        message=f"/skill {skill.slug} {request.query.strip()}",
+        channel=GENERAL_SKILL_DEBUG_CHANNEL,
+        message_visibility="internal",
+        debug=True,
+    )
 
     def stream_events() -> Iterator[str]:
-        events: queue.Queue[tuple[str, dict[str, object]] | None] = queue.Queue()
-
-        def sink(item: dict[str, object]) -> None:
-            events.put(("trace", item))
+        terminal: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
 
         def worker() -> None:
             try:
-                response = _run_general_skill_operation(
-                    skill_snapshot,
-                    request,
-                    model_snapshot,
-                    current_user.id,
-                    sink,
-                )
-                events.put(("complete", response.model_dump(mode="json")))
+                with Session(engine) as worker_db:
+                    response = AgentLoop(worker_db).handle_turn(harness_request)
+                    assistant = worker_db.exec(
+                        select(Message)
+                        .where(
+                            Message.tenant_id == request.tenant_id,
+                            Message.session_id == session_id,
+                            Message.role == "assistant",
+                        )
+                        .order_by(Message.created_at.desc())
+                    ).first()
+                    terminal.put(
+                        (
+                            "complete",
+                            _harness_skill_run_response(
+                                skill.slug,
+                                response,
+                                dict(assistant.metadata_json or {}) if assistant else {},
+                            ),
+                        )
+                    )
             except Exception as exc:  # pragma: no cover - defensive stream boundary
-                events.put(("error", {"message": str(exc)}))
-            finally:
-                events.put(None)
+                terminal.put(("error", {"message": str(exc)}))
 
         threading.Thread(target=worker, daemon=True).start()
         yield _sse(
@@ -726,35 +817,132 @@ def run_general_skill_stream(
             {
                 "skill_slug": skill_snapshot.slug,
                 "operation": request.operation,
-                "max_attempts": request.max_attempts,
+                "execution_engine": "harness_v2",
+                "session_id": session_id,
+                "client_turn_id": client_turn_id,
+                "idle_timeout_seconds": GENERAL_SKILL_STREAM_IDLE_TIMEOUT_SECONDS,
             },
         )
-        last_worker_event_at = time.monotonic()
-        while True:
-            try:
-                item = events.get(timeout=5)
-            except queue.Empty:
-                if (
-                    time.monotonic() - last_worker_event_at
-                    > GENERAL_SKILL_STREAM_IDLE_TIMEOUT_SECONDS
-                ):
+        last_event_at = time.monotonic()
+        last_heartbeat_at = 0.0
+        cursor: tuple[object, str] | None = None
+        pending_terminal: tuple[str, object] | None = None
+        with Session(engine) as poll_db:
+            while True:
+                rows = _skill_debug_events_after(
+                    poll_db,
+                    request.tenant_id,
+                    session_id,
+                    cursor,
+                )
+                for row in rows:
+                    cursor = (row.created_at, row.id)
+                    last_event_at = time.monotonic()
+                    yield _sse("trace", _skill_debug_trace(row))
+
+                if pending_terminal is None:
+                    try:
+                        pending_terminal = terminal.get_nowait()
+                    except queue.Empty:
+                        # The worker is still running; keep polling persisted trace events.
+                        pass
+                if pending_terminal is not None and not rows:
+                    event, payload = pending_terminal
+                    if isinstance(payload, GeneralSkillRunResponse):
+                        payload = payload.model_dump(mode="json")
+                    yield _sse(event, payload)
+                    return
+
+                now = time.monotonic()
+                if now - last_event_at > GENERAL_SKILL_STREAM_IDLE_TIMEOUT_SECONDS:
                     yield _sse(
                         "error",
                         {
-                            "message": "通用技能处理超时，请检查模型配置或稍后重试。",
+                            "message": "技能测试 10 分钟内未收到新的执行事件，请检查模型配置或稍后重试。",
                             "code": "general_skill_stream_timeout",
+                            "session_id": session_id,
+                            "client_turn_id": client_turn_id,
                         },
                     )
                     return
-                yield _sse("heartbeat", {"phase": "running"})
-                continue
-            if item is None:
-                return
-            last_worker_event_at = time.monotonic()
-            event, payload = item
-            yield _sse(event, payload)
+                if now - last_heartbeat_at >= 5:
+                    last_heartbeat_at = now
+                    yield _sse(
+                        "heartbeat",
+                        {
+                            "phase": "harness_v2",
+                            "session_id": session_id,
+                            "client_turn_id": client_turn_id,
+                        },
+                    )
+                time.sleep(0.1)
 
     return StreamingResponse(stream_events(), media_type="text/event-stream")
+
+
+def _skill_debug_events_after(
+    db: Session,
+    tenant_id: str,
+    session_id: str,
+    cursor: tuple[object, str] | None,
+) -> list[AgentEvent]:
+    statement = select(AgentEvent).where(
+        AgentEvent.tenant_id == tenant_id,
+        AgentEvent.session_id == session_id,
+    )
+    if cursor is not None:
+        created_at, event_id = cursor
+        statement = statement.where(
+            (AgentEvent.created_at > created_at)
+            | ((AgentEvent.created_at == created_at) & (AgentEvent.id > event_id))
+        )
+    db.expire_all()
+    return list(
+        db.exec(statement.order_by(AgentEvent.created_at, AgentEvent.id).limit(200)).all()
+    )
+
+
+def _skill_debug_trace(row: AgentEvent) -> dict[str, object]:
+    payload = dict(row.payload_json or {})
+    phase = str(payload.get("phase") or row.event_type)
+    message = str(payload.get("text") or payload.get("message") or phase)
+    return {
+        **payload,
+        "event_type": row.event_type,
+        "phase": phase,
+        "message": message,
+        "event_id": row.id,
+        "execution_engine": "harness_v2",
+    }
+
+
+def _harness_skill_run_response(
+    slug: str,
+    response: ChatTurnResponse,
+    assistant_metadata: dict[str, object],
+) -> GeneralSkillRunResponse:
+    citations = assistant_metadata.get("knowledge_citations")
+    artifacts = assistant_metadata.get("harness_artifacts")
+    success = not bool(response.runtime_error_code)
+    return GeneralSkillRunResponse(
+        skill_slug=slug,
+        operation="execute",
+        structured_result={
+            "success": success,
+            "execution_engine": "harness_v2",
+            "session_id": response.session_id,
+            "runtime_error_code": response.runtime_error_code,
+            "step_result": (
+                response.step_result.model_dump(mode="json")
+                if response.step_result is not None
+                else None
+            ),
+            "citations": citations if isinstance(citations, list) else [],
+        },
+        artifacts=artifacts if isinstance(artifacts, list) else [],
+        stderr=response.reply if response.runtime_error_code else "",
+        reply=response.reply,
+    )
 
 
 def _run_general_skill_operation(
@@ -804,7 +992,12 @@ def _private_skill_owned_by_agent(
             AgentResourceBinding.resource_id == row.id,
         )
     ).first()
-    return bool(binding and (binding.metadata_json or {}).get("scope") == "agent_private")
+    binding_metadata = binding.metadata_json if binding else {}
+    return bool(
+        binding
+        and binding_metadata.get("scope") == "agent_private"
+        and binding_metadata.get("owner_agent_id") == agent_id
+    )
 
 
 def _ensure_general_skill_visible(
@@ -977,6 +1170,58 @@ def _normalize_skill_files(
             continue
         normalized.append(file.model_copy(update={"path": file.path[len(prefix) :]}))
     return normalized
+
+
+def _replace_skill_markdown_in_package(
+    row: GeneralSkill,
+    markdown: str,
+) -> list[GeneralSkillFile]:
+    existing = [
+        GeneralSkillFile.model_validate(item) for item in _skill_files_or_markdown(row)
+    ]
+    files = _normalize_skill_files(existing, None)
+    updated: list[GeneralSkillFile] = []
+    for file in files:
+        if file.path.rsplit("/", 1)[-1].lower() == "skill.md":
+            encoded = markdown.encode("utf-8")
+            updated.append(
+                file.model_copy(
+                    update={
+                        "content": markdown,
+                        "size": len(encoded),
+                        "mime_type": file.mime_type or "text/markdown",
+                    }
+                )
+            )
+        else:
+            updated.append(file)
+    return updated
+
+
+def _validate_skill_package_references(files: list[GeneralSkillFile]) -> None:
+    skill_file = _find_skill_file(files)
+    if skill_file is None:
+        return
+    package_paths = {file.path.replace("\\", "/").lstrip("./") for file in files}
+    referenced_paths: set[str] = set()
+    for match in LOCAL_REFERENCE_PATTERN.finditer(skill_file.content):
+        raw_path = unquote(match.group(0)).replace("\\", "/")
+        raw_path = raw_path.split("#", 1)[0].split("?", 1)[0]
+        raw_path = raw_path.rstrip(")]}.,;:!?，。；：！？")
+        if any(marker in raw_path for marker in ("*", "{", "}")):
+            continue
+        normalized = raw_path.removeprefix("./").strip("/")
+        if normalized and not normalized.endswith("/"):
+            referenced_paths.add(normalized)
+    missing = sorted(referenced_paths - package_paths)
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "General skill package is missing files referenced by SKILL.md: "
+                + ", ".join(missing)
+            ),
+        )
 
 
 def _skill_directories_from_values(

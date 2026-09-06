@@ -19,6 +19,7 @@ RouterDecisionValue = Literal[
     "clarify",
 ]
 TaskFrameKind = Literal["sop", "conversation"]
+TaskFrameExecutionTarget = Literal["self", "team_member"]
 TaskFrameRunStatus = Literal[
     "queued",
     "running",
@@ -58,11 +59,19 @@ class PlannedTaskFrame(BaseModel):
     requirements: list[str] = Field(default_factory=list)
     slot_hints: dict[str, Any] = Field(default_factory=dict)
     depends_on_task_ids: list[str] = Field(default_factory=list)
+    execution_target: TaskFrameExecutionTarget = "self"
+    assignee_agent_id: Optional[str] = None
+    activation_condition: dict[str, Any] = Field(default_factory=dict)
     source_message: Optional[str] = None
 
     @field_validator("slot_hints", mode="before")
     @classmethod
     def _default_null_slot_hints(cls, value: Any) -> Any:
+        return {} if value is None else value
+
+    @field_validator("activation_condition", mode="before")
+    @classmethod
+    def _default_null_activation_condition(cls, value: Any) -> Any:
         return {} if value is None else value
 
     @field_validator("requirements", "depends_on_task_ids", mode="before")
@@ -181,6 +190,7 @@ class StepAgentResult(BaseModel):
     next_step_id: Optional[str] = None
     is_step_completed: bool = False
     handoff: bool = False
+    structured_result: Any | None = None
 
 
 class SessionPublic(BaseModel):
@@ -211,14 +221,36 @@ class ChatTurnRequest(BaseModel):
     attachments: list["ChatAttachmentRead"] = Field(default_factory=list)
     channel: str = "web"
     interaction_mode: Literal["normal", "scheduled_task", "team_task", "team_tl"] = "normal"
+    team_context: Optional["TeamPlannerContext"] = Field(default=None, exclude=True)
     # Server-only prompt prefix. It is consumed by the runtime but never persisted as
     # the user's visible message or serialized into background-job payloads.
     context_injection: Optional[str] = Field(default=None, exclude=True)
     # Internal retry turns remain auditable in storage while staying out of the
     # user-facing conversation and subsequent conversational context.
     message_visibility: Literal["visible", "internal"] = Field(default="visible", exclude=True)
+    # Internal callers such as scheduled tasks may pin one published SOP.  This
+    # is deliberately separate from the visible message so execution does not
+    # depend on the planner rediscovering the same SOP on every wake-up.
+    forced_sop_id: Optional[str] = Field(default=None, exclude=True)
+    # Scheduled tasks may freeze the selected SOP at save time. The snapshot is
+    # server-only and is applied only after the current employee binding has
+    # been verified, so pinning a version never bypasses capability access.
+    forced_sop_snapshot: Optional[dict[str, Any]] = Field(default=None, exclude=True)
     client_timezone: Optional[str] = None
     debug: bool = False
+
+
+class TeamPlannerMember(BaseModel):
+    agent_id: str
+    name: str
+    role: Optional[str] = None
+    capabilities: list[str] = Field(default_factory=list)
+
+
+class TeamPlannerContext(BaseModel):
+    team_id: str
+    leader_agent_id: str
+    members: list[TeamPlannerMember] = Field(default_factory=list)
 
 
 class ChatAttachmentRead(BaseModel):

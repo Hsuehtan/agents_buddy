@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-from copy import deepcopy
 import hashlib
+import json
 import time
+from copy import deepcopy
 from typing import Any
 
 from sqlalchemy.exc import IntegrityError
+from sqlmodel import select
 
-from app.core.capability_manifest import CapabilityManifestBuilder
-from app.core.capability_discovery import project_capability_manifest
 from app.core.cancellation import is_chat_turn_cancelled
+from app.core.capability_discovery import project_capability_manifest
+from app.core.capability_manifest import CapabilityManifestBuilder
 from app.core.harness_agent import (
     HarnessExecutionCancelled,
     HarnessExecutionFenced,
@@ -20,14 +22,15 @@ from app.core.harness_attachments import (
     validated_task_image_payloads,
 )
 from app.core.harness_capability_invoker import HarnessCapabilityInvoker
-from app.core.harness_session_lock import (
-    acquire_harness_session,
-    release_harness_session,
-)
+from app.core.published_deliverables import list_published_deliverables
 from app.core.harness_session_lease import (
     HarnessSessionLeaseLost,
     HarnessSessionLeaseStore,
     HarnessSessionLeaseToken,
+)
+from app.core.harness_session_lock import (
+    acquire_harness_session,
+    release_harness_session,
 )
 from app.core.harness_turn_store import HarnessTurnStore
 from app.core.slash_commands import (
@@ -39,6 +42,7 @@ from app.core.slash_commands import (
     resolve_capability,
     slash_command_message,
 )
+from app.core.slot_hydration_policy import SlotHydrationPolicy
 from app.core.task_frame_store import (
     TaskFrameClaimConflict,
     TaskFrameStore,
@@ -56,6 +60,7 @@ from app.db.models import (
     HarnessTurnRecord,
     Message,
     Skill,
+    Team,
 )
 from app.knowledge.citations import compact_knowledge_citation_labels
 from app.memory.service import memory_read
@@ -67,6 +72,108 @@ from app.session.session_schema import (
     TurnPlan,
 )
 from app.skills.nesting import discoverable_sops, expand_visible_sops
+
+
+def _turn_skill_projection(
+    source_skills: list[Skill],
+    *,
+    interaction_mode: str,
+) -> tuple[list[Skill], list[Skill]]:
+    """Project executable and routable SOPs for every supported turn mode.
+
+    Team TL conversations already own a dedicated session, so hiding the
+    leader's SOPs here would only disable valid work; it is not required for
+    state isolation.
+    """
+
+    _ = interaction_mode
+    skills = expand_visible_sops(source_skills)
+    return skills, discoverable_sops(skills)
+
+
+def _turn_planner_message(
+    request: ChatTurnRequest,
+) -> str:
+    """Keep server-only execution context out of Planner task requirements."""
+
+    return request.message
+
+
+def _apply_forced_sop_snapshot(
+    source_skills: list[Skill],
+    forced_sop_id: str | None,
+    snapshot: dict[str, Any] | None,
+) -> list[Skill]:
+    """Replace one currently accessible SOP with its immutable scheduled snapshot."""
+
+    target = str(forced_sop_id or "").strip()
+    if not target or not snapshot:
+        return source_skills
+    if str(snapshot.get("skill_id") or "").strip() != target:
+        raise SlashCommandError(
+            "FORCED_SOP_SNAPSHOT_INVALID",
+            "定时任务保存的 SOP 快照与指定 SOP 不一致。",
+        )
+    content = snapshot.get("content_json")
+    if not isinstance(content, dict):
+        raise SlashCommandError(
+            "FORCED_SOP_SNAPSHOT_INVALID",
+            "定时任务保存的 SOP 快照内容无效。",
+        )
+    current = next((skill for skill in source_skills if skill.skill_id == target), None)
+    if current is None:
+        # Keep the normal capability-access error from resolve_sop. A historical
+        # snapshot must never resurrect an SOP that is no longer bound/visible.
+        return source_skills
+    pinned = Skill(
+        id=current.id,
+        tenant_id=current.tenant_id,
+        skill_id=current.skill_id,
+        version=str(snapshot.get("version") or current.version),
+        name=str(snapshot.get("name") or current.name),
+        business_domain=(
+            str(snapshot.get("business_domain"))
+            if snapshot.get("business_domain") is not None
+            else current.business_domain
+        ),
+        description=(
+            str(snapshot.get("description"))
+            if snapshot.get("description") is not None
+            else current.description
+        ),
+        content_json=deepcopy(content),
+        status="published",
+        created_at=current.created_at,
+        updated_at=current.updated_at,
+    )
+    if hasattr(current, "agent_branch_meta"):
+        object.__setattr__(pinned, "agent_branch_meta", getattr(current, "agent_branch_meta"))
+    return [pinned if skill.skill_id == target else skill for skill in source_skills]
+
+
+def _turn_slash_selection(request: ChatTurnRequest) -> SlashCommandSelection | None:
+    """Resolve user slash commands and server-pinned scheduled SOPs uniformly."""
+
+    selection = parse_slash_command(request.message)
+    forced_sop_id = str(request.forced_sop_id or "").strip()
+    if forced_sop_id:
+        if selection is not None:
+            raise SlashCommandError(
+                "FORCED_SOP_COMMAND_CONFLICT",
+                "内部指定的 SOP 不能与用户斜杠指令同时使用。",
+            )
+        return SlashCommandSelection(
+            kind="sop",
+            target=forced_sop_id,
+            prompt=request.message,
+            raw=f"/sop {forced_sop_id}",
+        )
+    if selection and request.interaction_mode == "scheduled_task":
+        raise SlashCommandError(
+            "SLASH_COMMAND_MODE_CONFLICT",
+            "定时任务执行不能从任务文本解析斜杠指令，请使用结构化 SOP 选择。",
+        )
+    return selection
 
 
 class HarnessV2Engine:
@@ -150,12 +257,7 @@ class HarnessV2Engine:
             },
         )
 
-        self.slash_command = parse_slash_command(request.message)
-        if self.slash_command and request.interaction_mode == "scheduled_task":
-            raise SlashCommandError(
-                "SLASH_COMMAND_MODE_CONFLICT",
-                "斜杠能力指令不能与定时任务创建模式同时使用。",
-            )
+        self.slash_command = _turn_slash_selection(request)
         execution_message = (
             slash_command_message(self.slash_command)
             if self.slash_command
@@ -173,18 +275,23 @@ class HarnessV2Engine:
         source_skills = self.owner._list_published_skills(
             request.tenant_id, session.agent_id
         )
-        # A team TL session is a group-chat orchestration surface, not the
-        # leader employee's personal working session. Hide personal SOPs from
-        # this turn without mutating or cancelling their durable state.
-        if request.interaction_mode == "team_tl":
-            skills = []
-            routing_skills = []
-        else:
-            skills = expand_visible_sops(source_skills)
-            routing_skills = discoverable_sops(skills)
-            self.owner._drop_unavailable_skill_state(
-                request.tenant_id, session, skills
-            )
+        source_skills = _apply_forced_sop_snapshot(
+            source_skills,
+            request.forced_sop_id,
+            request.forced_sop_snapshot,
+        )
+        # Team TL conversations use a dedicated ChatSession, so the leader can
+        # safely execute their own SOPs without mutating a personal chat. Keep
+        # the same published/discoverable SOP boundary in every interaction
+        # mode; team orchestration remains an additional conversation concern,
+        # not a reason to hide the leader's executable workflow.
+        skills, routing_skills = _turn_skill_projection(
+            source_skills,
+            interaction_mode=request.interaction_mode,
+        )
+        self.owner._drop_unavailable_skill_state(
+            request.tenant_id, session, skills
+        )
         memory_context = [
             memory_read(row)
             for row in self.owner.memory.context_memories(
@@ -212,6 +319,14 @@ class HarnessV2Engine:
 
         self._renew_session_lease()
         planner_state = self.store.planner_state(session)
+        team_context = request.team_context
+        team: Team | None = None
+        if request.interaction_mode == "team_tl" and session.team_id:
+            team = self.db.get(Team, session.team_id)
+            if team is not None and team_context is None:
+                from app.teams.wakeup import build_team_planner_context
+
+                team_context = build_team_planner_context(self.db, team)
         if self.slash_command:
             if self.slash_command.kind in {"skill", "tool"}:
                 direct_manifest = self.manifests.build(
@@ -230,16 +345,36 @@ class HarnessV2Engine:
             )
         else:
             plan = self.planner.plan(
-                execution_request.message,
+                _turn_planner_message(request),
                 session,
                 routing_skills,
                 model_config,
                 deepcopy(conversation_context),
                 memory_context,
                 planner_state,
+                interaction_mode=request.interaction_mode,
+                team_context=team_context,
             )
         self._renew_session_lease()
         self._raise_if_cancelled(request, session)
+        slot_hydration = SlotHydrationPolicy.hydrate_plan(
+            session,
+            plan,
+            skills,
+            memory_context,
+        )
+        if slot_hydration:
+            self.events.record(
+                request.tenant_id,
+                session.id,
+                "slots_hydrated",
+                {
+                    **slot_hydration,
+                    "source": "memory",
+                    "turn_id": user_message.id,
+                    "execution_engine": "harness_v2",
+                },
+            )
         router_decision = turn_plan_router_decision(plan)
         self.events.record(
             request.tenant_id,
@@ -262,6 +397,34 @@ class HarnessV2Engine:
                 "execution_engine": "harness_v2",
             },
         )
+        team_publish_result = None
+        remote_frames = [
+            frame for frame in plan.task_frames if frame.execution_target == "team_member"
+        ]
+        if remote_frames:
+            if request.interaction_mode != "team_tl" or team is None:
+                raise RuntimeError("团队成员 TaskFrame 缺少可信团队上下文。")
+            from app.teams.wakeup import publish_team_planner_frames
+
+            team_publish_result = publish_team_planner_frames(
+                self.db,
+                team=team,
+                session=session,
+                source_turn_id=user_message.id,
+                created_by_user_id=request.user_id,
+                frames=remote_frames,
+            )
+            if team_publish_result is None:
+                raise RuntimeError("团队成员 TaskFrame 未能持久化，已停止本轮虚假分发。")
+            plan = plan.model_copy(
+                update={
+                    "task_frames": [
+                        frame
+                        for frame in plan.task_frames
+                        if frame.execution_target != "team_member"
+                    ]
+                }
+            )
         if plan.decision == "complete_task":
             active_task_frame_id = self.store.active_task_frame_id(session)
             self.store.complete_active_frame(
@@ -401,7 +564,10 @@ class HarnessV2Engine:
                 active_skill,
                 model_config,
                 memory_context,
-                self.store.dependency_results(row),
+                [
+                    *self.store.dependency_results(row),
+                    *self.store.referenced_session_results(row),
+                ],
                 remaining_turn_actions,
             )
             remaining_turn_actions = max(
@@ -457,30 +623,55 @@ class HarnessV2Engine:
             strict=False,
         ):
             payload["knowledge_citations"] = list(result.citations)
+        _inject_handoff_context(self.db, session, execution_payloads, execution_results, request)
 
         # ``last_skill`` is the execution-expanded parent graph. Prefer it so a
         # nested SOP's response rules remain available after the child graph
         # reaches a terminal node. Falling back to the stored row is only
         # needed for turns that did not execute a TaskFrame.
-        response_skill = None if request.interaction_mode == "team_tl" else (
-            last_skill or self.owner._get_active_skill(
-                request.tenant_id, session.active_skill_id, session.agent_id
-            )
+        response_skill = last_skill or self.owner._get_active_skill(
+            request.tenant_id, session.active_skill_id, session.agent_id
         )
         self._renew_session_lease()
-        reply = self.owner.response_generator.generate(
-            execution_request.message,
-            session,
-            response_skill,
-            router_decision,
-            last_step_result,
-            None,
-            model_config,
-            self.owner._get_persona_prompt(request.tenant_id, session.agent_id),
-            memory_context,
-            conversation_context,
-            execution_payloads,
-        )
+        reply = _single_task_reply(execution_results)
+        if team_publish_result is not None and not execution_results:
+            task_count = len(team_publish_result.task_ids)
+            reply = (
+                f"已完成 {task_count} 个团队任务的拆分与派发。"
+            )
+        is_handoff = any(result.status == "handoff" for result in execution_results)
+        if is_handoff:
+            # Handoff is now queued for a human; do not let the execution model
+            # describe the missing native channel as if the request failed.
+            reply = "已为你提交人工处理请求，请稍候，工作人员会尽快回复。"
+            if self.owner.stream_sink is not None:
+                for chunk in self.owner.response_generator.chunk_text(reply):
+                    self.owner.stream_sink.on_delta(chunk)
+        elif reply is None:
+            response_args = (
+                execution_request.message,
+                session,
+                response_skill,
+                router_decision,
+                last_step_result,
+                None,
+                model_config,
+                self.owner._get_persona_prompt(request.tenant_id, session.agent_id),
+                memory_context,
+                conversation_context,
+                execution_payloads,
+            )
+            if self.owner.stream_sink is not None:
+                parts: list[str] = []
+                for chunk in self.owner.response_generator.generate_stream(*response_args):
+                    parts.append(chunk)
+                    self.owner.stream_sink.on_delta(chunk)
+                reply = "".join(parts).strip()
+            else:
+                reply = self.owner.response_generator.generate(*response_args)
+        elif self.owner.stream_sink is not None:
+            for chunk in self.owner.response_generator.chunk_text(reply):
+                self.owner.stream_sink.on_delta(chunk)
         self._renew_session_lease()
         reply, citations = compact_knowledge_citation_labels(reply, citations)
         artifacts = _aggregate_artifacts(execution_results)
@@ -488,6 +679,15 @@ class HarnessV2Engine:
             "execution_engine": "harness_v2",
             "task_frame_ids": [row.task_id for row in records],
         }
+        if team_publish_result is not None:
+            assistant_metadata["team_run_id"] = team_publish_result.run_id
+            assistant_metadata["team_task_ids"] = list(team_publish_result.task_ids)
+            assistant_metadata["team_progress"] = {
+                "phase": "collecting",
+                "completed_tasks": 0,
+                "total_tasks": len(team_publish_result.task_ids),
+                "status_text": "正在等待成员回复",
+            }
         if request.client_turn_id:
             assistant_metadata["client_turn_id"] = request.client_turn_id
         if request.message_visibility != "visible":
@@ -500,6 +700,12 @@ class HarnessV2Engine:
             assistant_metadata["slash_command"] = self.slash_command.model_dump(
                 mode="json"
             )
+        # Cancellation and normal projection compete for this durable receipt.
+        # Only the winner may append a terminal assistant message.
+        self._raise_if_cancelled(request, session)
+        if self.owner.stream_sink is not None:
+            self.owner.stream_delivery_succeeded = self.owner.stream_sink.finish()
+        self.turn_store.begin_completion(self.turn_record)
         reply = self.owner._finalize_turn(
             session,
             request.tenant_id,
@@ -548,6 +754,7 @@ class HarnessV2Engine:
 
     def _renew_session_lease(self) -> None:
         self.session_leases.renew(self.session_lease)
+        self.turn_store.renew(self.turn_record)
         self.db.commit()
 
     def _renew_execution_leases(
@@ -562,6 +769,7 @@ class HarnessV2Engine:
             )
         try:
             self.session_leases.renew(self.session_lease)
+            self.turn_store.renew(self.turn_record)
             self.store.renew_running_lease(
                 row,
                 lease_owner=lease_owner,
@@ -584,6 +792,8 @@ class HarnessV2Engine:
         max_actions: int,
     ) -> tuple[TaskExecutionResult, StepAgentResult]:
         self.store.mark_running(row)
+        agent_loop = self.store.ensure_agent_loop(row)
+        loop_checkpoint = dict(agent_loop.checkpoint_json or {})
         self.active_frame_id = row.id
         self.active_frame_lease_owner = row.lease_owner
         self.active_frame_attempt_no = row.attempt_no
@@ -596,6 +806,12 @@ class HarnessV2Engine:
             db=self.db,
         )
         image_payloads = validated_task_image_payloads(request.attachments)
+        published_deliverables = list_published_deliverables(
+            self.db,
+            tenant_id=request.tenant_id,
+            session_id=session.id,
+            exclude_task_frame_id=row.task_id,
+        )
         step_timeout_seconds = (
             _skill_step_timeout_seconds(active_skill)
             if frame.kind == "sop"
@@ -609,15 +825,19 @@ class HarnessV2Engine:
                 "task_frame_id": row.task_id,
                 "kind": row.kind,
                 "skill_id": row.skill_id,
+                "skill_name": active_skill.name if active_skill is not None else None,
                 "step_id": row.step_id,
                 "step_timeout_seconds": step_timeout_seconds,
                 "harness_max_actions": max_actions,
+                "agent_loop_id": agent_loop.id,
+                "agent_loop_kind": agent_loop.kind,
                 "execution_engine": "harness_v2",
             },
         )
         remaining_actions = max_actions
         results: list[TaskExecutionResult] = []
         last_step_result = StepAgentResult()
+        run: HarnessRunRecord | None = None
 
         while remaining_actions > 0:
             self._raise_if_cancelled(request, session)
@@ -648,11 +868,13 @@ class HarnessV2Engine:
                     *[_prior_result(item) for item in results],
                 ],
                 attachment_descriptors,
+                published_deliverables,
                 source_user_message=(
                     request.message
                     if row.source_turn_id == self.user_message_id
                     else _source_user_message(self.db, row)
                 ),
+                out_of_scope_task_intents=_sibling_task_intents(self.db, row),
             )
             if (
                 self.slash_command
@@ -672,13 +894,26 @@ class HarnessV2Engine:
                 lease_owner=self.active_frame_lease_owner,
                 attempt_no=self.active_frame_attempt_no,
             )
-            run = self.store.start_run(
-                row,
-                requirement=requirement.model_dump(mode="json"),
-                capability_snapshot=manifest.model_dump(mode="json"),
-                lease_owner=self.active_frame_lease_owner,
-                attempt_no=self.active_frame_attempt_no,
-            )
+            if run is None:
+                run = self.store.start_run(
+                    row,
+                    requirement=requirement.model_dump(mode="json"),
+                    capability_snapshot=manifest.model_dump(mode="json"),
+                    lease_owner=self.active_frame_lease_owner,
+                    attempt_no=self.active_frame_attempt_no,
+                )
+                self.store.save_agent_loop_checkpoint(
+                    agent_loop,
+                    loop_checkpoint,
+                    status="active",
+                    last_run_id=run.id,
+                )
+            else:
+                self.store.update_run_context(
+                    run,
+                    requirement=requirement.model_dump(mode="json"),
+                    capability_snapshot=manifest.model_dump(mode="json"),
+                )
             self.active_run_id = run.id
             self.db.commit()
 
@@ -691,6 +926,7 @@ class HarnessV2Engine:
                         **payload,
                         "task_frame_id": row.task_id,
                         "harness_run_id": run.id,
+                        "agent_loop_id": agent_loop.id,
                         "execution_engine": "harness_v2",
                     },
                 )
@@ -731,10 +967,49 @@ class HarnessV2Engine:
                 image_payloads=image_payloads,
                 step_deadline_monotonic=step_deadline_monotonic,
                 step_timeout_seconds=step_timeout_seconds,
+                checkpoint=loop_checkpoint,
             )
+            if request.channel == "human_handoff_resume" and result.status == "handoff":
+                # The human reply is already the handoff completion signal. Do not
+                # re-enter the same terminal handoff node during the resume turn.
+                result.status = "completed"
+            deferred_continuation = False
+            if frame.kind == "sop":
+                deferred_result = _defer_failed_step_after_completed_checkpoint(
+                    result,
+                    results,
+                )
+                if deferred_result is not result:
+                    deferred_continuation = True
+                    trace(
+                        "harness_step_continuation_deferred",
+                        {
+                            "failed_step_id": frame.target_step_id,
+                            "error": result.error,
+                            "checkpoint_step_id": row.step_id,
+                            "reason": "previous_step_already_produced_user_result",
+                        },
+                    )
+                    result = deferred_result
+            loop_checkpoint = dict(result.loop_checkpoint or {})
             _merge_discovered_artifacts(result, invoker.discover_artifacts())
+            loop_checkpoint["artifacts"] = list(result.artifacts)
+            self.store.save_agent_loop_checkpoint(
+                agent_loop,
+                loop_checkpoint,
+                status="active",
+                last_run_id=run.id,
+            )
             results.append(result)
             remaining_actions -= max(1, result.action_count)
+
+            if deferred_continuation:
+                # The previous SOP step was already committed and moved the
+                # session to this step.  Keep that durable checkpoint queued
+                # for a later turn instead of applying a transient failure to
+                # the session and replacing the useful answer already found.
+                last_step_result = _step_result(result)
+                break
 
             if frame.kind == "conversation":
                 if (
@@ -757,15 +1032,6 @@ class HarnessV2Engine:
                     )
                 else:
                     last_step_result = _step_result(result)
-                self.store.finish_run(
-                    run,
-                    status=result.status,
-                    action_count=result.action_count,
-                    result=result.model_dump(mode="json"),
-                    lease_owner=self.active_frame_lease_owner,
-                    attempt_no=self.active_frame_attempt_no,
-                )
-                self.active_run_id = None
                 break
 
             result = _enforce_required_slots(result, requirement, session)
@@ -834,21 +1100,23 @@ class HarnessV2Engine:
                 continue_frame = False
             else:
                 frame.target_step_id = session.active_step_id
-            self.store.finish_run(
-                run,
-                status=result.status,
-                action_count=result.action_count,
-                result=result.model_dump(mode="json"),
-                lease_owner=self.active_frame_lease_owner,
-                attempt_no=self.active_frame_attempt_no,
-            )
-            self.active_run_id = None
             if not continue_frame:
                 break
 
         combined = _combine_results(row.task_id, results)
+        if run is not None:
+            self.store.finish_run(
+                run,
+                status=combined.status,
+                action_count=combined.action_count,
+                result=combined.model_dump(mode="json"),
+                lease_owner=self.active_frame_lease_owner,
+                attempt_no=self.active_frame_attempt_no,
+            )
+            self.active_run_id = None
         row_status = combined.status
-        if row_status == "action_budget":
+        preserve_agent_loop = _is_recoverable_action_protocol_failure(combined)
+        if row_status == "action_budget" or preserve_agent_loop:
             row_status = "queued"
         self.store.finish_frame(
             row,
@@ -859,16 +1127,27 @@ class HarnessV2Engine:
             lease_owner=self.active_frame_lease_owner,
             attempt_no=self.active_frame_attempt_no,
         )
+        self.store.finish_agent_loop_for_frame(
+            row,
+            result_status=("queued" if preserve_agent_loop else combined.status),
+            checkpoint=loop_checkpoint,
+            last_run_id=run.id if run is not None else None,
+        )
         self.events.record(
             request.tenant_id,
             session.id,
             "task_frame_finished",
             {
                 "task_frame_id": row.task_id,
+                "kind": row.kind,
+                "skill_id": row.skill_id,
+                "skill_name": active_skill.name if active_skill is not None else None,
                 "status": combined.status,
                 "step_id": row.step_id,
                 "action_count": combined.action_count,
                 "error": combined.error,
+                "agent_loop_id": agent_loop.id,
+                "agent_loop_status": agent_loop.status,
                 "execution_engine": "harness_v2",
             },
         )
@@ -913,6 +1192,12 @@ class HarnessV2Engine:
                             "status": "cancelled",
                             "task_summary": "用户取消了当前 Harness 执行。",
                         },
+                    )
+                    self.store.finish_agent_loop_for_frame(
+                        row,
+                        result_status="cancelled",
+                        checkpoint=self.store.agent_loop_checkpoint(row),
+                        last_run_id=self.active_run_id,
                     )
         self.db.commit()
         turn_store = getattr(self, "turn_store", None)
@@ -982,6 +1267,12 @@ class HarnessV2Engine:
                         "task_summary": "Harness 执行中断，TaskFrame 已重新排队。",
                     },
                 )
+                self.store.finish_agent_loop_for_frame(
+                    row,
+                    result_status="action_budget",
+                    checkpoint=self.store.agent_loop_checkpoint(row),
+                    last_run_id=self.active_run_id,
+                )
         self.db.commit()
         turn_store = getattr(self, "turn_store", None)
         if turn_store is not None:
@@ -1045,6 +1336,7 @@ class HarnessV2Engine:
         )
         if active_skill is None:
             return None
+        self._record_skill_activation_event(session, row, active_skill)
         self.owner.runtime.restore_task_frame(
             session,
             {
@@ -1056,6 +1348,45 @@ class HarnessV2Engine:
             },
         )
         return active_skill
+
+    def _record_skill_activation_event(
+        self,
+        session: ChatSession,
+        row: HarnessTaskFrameRecord,
+        skill: Skill,
+    ) -> None:
+        """新发起/恢复 SOP 的 TaskFrame 落一条运行时事件。
+
+        SOP 调用次数统计(api/skills._skill_stats)只认 skill_started /
+        skill_resumed 事件;legacy 运行时移除后这两个事件不再产生,导致
+        管理端调用次数永远是 0。这里在新任务(start_new_task)与恢复
+        挂起任务(switch_to_pending)被调度时补记,payload 保持旧结构
+        (to_skill_id/to_skill_version/from_skill_id/from_step_id),
+        继续执行的 continue_active 不计新调用。
+        """
+        if row.decision == "start_new_task":
+            event_type = "skill_started"
+        elif row.decision == "switch_to_pending":
+            event_type = "skill_resumed"
+        else:
+            return
+        payload = {
+            "decision": row.decision,
+            "from_skill_id": session.active_skill_id,
+            "to_skill_id": skill.skill_id,
+            "from_skill_version": None,
+            "to_skill_version": skill.version,
+            "from_step_id": session.active_step_id,
+            "to_step_id": row.step_id,
+            "execution_engine": "harness_v2",
+            "task_frame_id": row.task_id,
+        }
+        self.events.record(
+            session.tenant_id,
+            session.id,
+            event_type,
+            payload,
+        )
 
     def _restore_visible_active_frame(
         self,
@@ -1191,6 +1522,58 @@ def _step_result(result: TaskExecutionResult) -> StepAgentResult:
         next_step_id=result.next_step_id,
         is_step_completed=result.status == "completed",
         handoff=result.status == "handoff",
+        structured_result=result.structured_result,
+    )
+
+
+def _is_recoverable_action_protocol_failure(result: TaskExecutionResult) -> bool:
+    """Keep a SOP AgentLoop resumable when only the model action envelope is invalid."""
+
+    error = result.error if isinstance(result.error, dict) else {}
+    return result.status == "failed" and str(error.get("code") or "") == (
+        "HARNESS_ACTION_INVALID"
+    )
+
+
+def _defer_failed_step_after_completed_checkpoint(
+    result: TaskExecutionResult,
+    completed_results: list[TaskExecutionResult],
+) -> TaskExecutionResult:
+    """Keep a committed SOP result when immediate continuation fails.
+
+    SOP TaskFrames may advance through several nodes in one request.  Once a
+    node has completed, its transition and slots are already durable.  A model
+    or protocol failure while starting the following node must therefore not
+    erase a user-visible result from the completed node.  Represent the
+    unfinished continuation as ``action_budget`` so the frame remains queued
+    and resumable at the already-persisted next step.
+    """
+
+    if result.status != "failed":
+        return result
+    checkpoint = next(
+        (
+            item
+            for item in reversed(completed_results)
+            if item.status == "completed" and item.reply_fragment.strip()
+        ),
+        None,
+    )
+    if checkpoint is None:
+        return result
+    failure_summary = str(result.task_summary or "").strip()
+    summaries = [
+        summary
+        for summary in (checkpoint.task_summary.strip(), failure_summary)
+        if summary
+    ]
+    return result.model_copy(
+        update={
+            "status": "action_budget",
+            "reply_fragment": checkpoint.reply_fragment,
+            "next_step_id": None,
+            "task_summary": "；".join(dict.fromkeys(summaries)),
+        }
     )
 
 
@@ -1231,16 +1614,23 @@ def _combine_results(
             error={"code": "EMPTY_TASK_RESULT"},
         )
     last = results[-1]
+    terminal_reply = next(
+        (
+            item.reply_fragment.strip()
+            for item in reversed(results)
+            if item.reply_fragment.strip()
+        ),
+        "",
+    )
     return TaskExecutionResult(
         task_frame_id=task_frame_id,
         status=last.status,
-        reply_fragment="\n".join(
-            dict.fromkeys(
-                item.reply_fragment.strip()
-                for item in results
-                if item.reply_fragment.strip()
-            )
-        ),
+        # A SOP TaskFrame can advance through several steps in one turn.  Each
+        # step produces a finish reply, but only the terminal step is the
+        # user-visible answer for that TaskFrame.  Keep intermediate summaries
+        # and structured results below without concatenating their transitional
+        # replies into a duplicated final response.
+        reply_fragment=terminal_reply,
         slot_updates={
             key: value
             for item in results
@@ -1262,6 +1652,7 @@ def _combine_results(
             for item in results
             for capability_result in item.capability_results
         ],
+        structured_result=last.structured_result,
         artifacts=[
             artifact
             for item in results
@@ -1277,6 +1668,42 @@ def _combine_results(
         action_count=sum(item.action_count for item in results),
         error=last.error,
     )
+
+
+def _single_task_reply(results: list[TaskExecutionResult]) -> str | None:
+    """Use a lone TaskFrame's terminal reply without another model pass.
+
+    ``finish`` already asks the Harness model for the user-facing reply.  A
+    response synthesis pass is only useful when several TaskFrames must be
+    reconciled.  Empty replies still fall back to ``ResponseGenerator`` so
+    malformed or legacy execution results keep the existing recovery path.
+    """
+
+    if len(results) != 1:
+        return None
+    result = results[0]
+    reply = str(result.reply_fragment or "").strip()
+    if _structured_reply_requires_synthesis(reply, result.structured_result):
+        return None
+    return reply or None
+
+
+def _structured_reply_requires_synthesis(reply: str, structured_result: Any) -> bool:
+    """Reject an obviously partial JSON projection when complete data is available."""
+
+    if structured_result is None or not reply:
+        return False
+    looks_like_json = reply.startswith("{") or (
+        reply.startswith("[")
+        and (len(reply) == 1 or reply[1:2] in {"{", "[", '"'})
+    )
+    if not looks_like_json:
+        return False
+    try:
+        projected = json.loads(reply)
+    except (json.JSONDecodeError, TypeError):
+        return True
+    return projected != structured_result
 
 
 def _response_task_payload(
@@ -1308,8 +1735,55 @@ def _response_task_payload(
             else None
         ),
         "task_summary": result.task_summary,
+        "structured_result": result.structured_result,
         "artifacts": list(result.artifacts),
     }
+
+
+def _inject_handoff_context(
+    db: object,
+    session: ChatSession,
+    payloads: list[dict[str, object]],
+    results: list[TaskExecutionResult],
+    request: ChatTurnRequest | None = None,
+) -> None:
+    """在 resume turn 执行期间注入 handoff_info(含 human_reply),供 response_generator 转述。
+
+    判定 resume turn:request.channel == "human_handoff_resume"(由 _resume_human_handoff_worker
+    传入)。此时 handoff 已 answered 且 human_reply 已落库,直接注入即可——不再依赖
+    resume_finished_at 标记(原标记在 worker 写入时机晚于 turn 执行,导致注入永远 miss)。
+    handoff 状态的 task(本轮新触发转人工)也注入 handoff_info(无 human_reply),
+    用于告知用户已转交。
+    """
+    from app.db.models import HumanHandoffRequest
+
+    handoff = db.exec(
+        select(HumanHandoffRequest)
+        .where(HumanHandoffRequest.session_id == session.id)
+        .order_by(HumanHandoffRequest.created_at.desc())
+    ).first()
+    if not handoff:
+        return
+    notify_message_id = handoff.notify_message_id or ""
+    human_reply = (handoff.human_reply or "").strip()
+    is_answered = handoff.status in ("answered", "resolved") and bool(human_reply)
+    # resume turn:由 worker 显式传入 channel 标识判定,时序可靠。
+    is_resume_turn = (
+        bool(request and getattr(request, "channel", "") == "human_handoff_resume")
+        and is_answered
+    )
+    for payload, result in zip(payloads, results, strict=False):
+        if is_resume_turn or payload.get("status") == "handoff":
+            pass
+        else:
+            continue
+        handoff_info: dict[str, Any] = {
+            "handoff_id": handoff.id,
+            "notified_via_feishu": bool(notify_message_id),
+        }
+        if is_answered:
+            handoff_info["human_reply"] = human_reply
+        payload["handoff_info"] = handoff_info
 
 
 def _globalize_citations(
@@ -1504,6 +1978,7 @@ def _prior_result(result: TaskExecutionResult) -> dict[str, Any]:
         "slot_updates": result.slot_updates,
         "capability_results": result.capability_results,
         "artifacts": result.artifacts,
+        "structured_result": result.structured_result,
     }
 
 
@@ -1512,6 +1987,26 @@ def _source_user_message(db: Any, row: HarnessTaskFrameRecord) -> str:
     if message is None or message.role != "user":
         return ""
     return str(message.content or "").strip()
+
+
+def _sibling_task_intents(
+    db: Any,
+    row: HarnessTaskFrameRecord,
+) -> list[str]:
+    """Return work from the same user turn that belongs to another TaskFrame."""
+
+    siblings = db.exec(
+        select(HarnessTaskFrameRecord).where(
+            HarnessTaskFrameRecord.session_id == row.session_id,
+            HarnessTaskFrameRecord.source_turn_id == row.source_turn_id,
+            HarnessTaskFrameRecord.id != row.id,
+        )
+    ).all()
+    return [
+        str(item.user_intent or "").strip()
+        for item in siblings
+        if str(item.user_intent or "").strip()
+    ]
 
 
 def _skill_step_timeout_seconds(skill: Skill | None) -> int | None:
