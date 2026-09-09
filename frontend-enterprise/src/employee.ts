@@ -6,19 +6,16 @@ import {
   type EnterpriseAuthUser,
 } from './auth';
 
-import avatarAfterSales from './assets/staffdeck/staffdeck-avatar-after-sales.png';
-import avatarCommerce from './assets/staffdeck/staffdeck-avatar-commerce.png';
-import avatarData from './assets/staffdeck/staffdeck-avatar-data.png';
-import avatarDefault from './assets/staffdeck/staffdeck-avatar-default.png';
-import avatarKnowledge from './assets/staffdeck/staffdeck-avatar-knowledge.png';
-import avatarMarketing from './assets/staffdeck/staffdeck-avatar-marketing.png';
-import avatarOps from './assets/staffdeck/staffdeck-avatar-ops.png';
-import avatarOverall from './assets/staffdeck/staffdeck-avatar-overall.png';
-import avatarProcurement from './assets/staffdeck/staffdeck-avatar-procurement.png';
-import avatarProject from './assets/staffdeck/staffdeck-avatar-project.png';
-import avatarQuality from './assets/staffdeck/staffdeck-avatar-quality.png';
-import avatarSales from './assets/staffdeck/staffdeck-avatar-sales.png';
-import avatarService from './assets/staffdeck/staffdeck-avatar-service.png';
+import avatar01 from './assets/staffdeck/staffdeck-avatar-01.png';
+import avatar02 from './assets/staffdeck/staffdeck-avatar-02.png';
+import avatar03 from './assets/staffdeck/staffdeck-avatar-03.png';
+import avatar04 from './assets/staffdeck/staffdeck-avatar-04.png';
+import avatar05 from './assets/staffdeck/staffdeck-avatar-05.png';
+import avatar06 from './assets/staffdeck/staffdeck-avatar-06.png';
+import avatar07 from './assets/staffdeck/staffdeck-avatar-07.png';
+import avatar08 from './assets/staffdeck/staffdeck-avatar-08.png';
+import avatar09 from './assets/staffdeck/staffdeck-avatar-09.png';
+import avatar10 from './assets/staffdeck/staffdeck-avatar-10.png';
 
 export type EmployeeProfile = {
   roleKey: string;
@@ -77,18 +74,18 @@ export const EMPLOYEE_AVATAR_PRESETS: EmployeeAvatarPreset[] = [
 export const DEFAULT_AVATAR_PRESET = 'service-orbit';
 
 const PRESET_AVATAR_IMAGES: Record<string, string> = {
-  'service-orbit': avatarService,
-  'after-sales-seal': avatarAfterSales,
-  'knowledge-node': avatarKnowledge,
-  'commerce-compass': avatarCommerce,
-  'ops-grid': avatarOps,
-  'quality-star': avatarQuality,
-  'sales-handshake': avatarSales,
-  'marketing-spark': avatarMarketing,
-  'procurement-check': avatarProcurement,
-  'project-board': avatarProject,
-  'data-insight': avatarData,
-  overall: avatarOverall,
+  'service-orbit': avatar01,
+  'after-sales-seal': avatar02,
+  'knowledge-node': avatar03,
+  'commerce-compass': avatar04,
+  'ops-grid': avatar05,
+  'quality-star': avatar06,
+  'sales-handshake': avatar07,
+  'marketing-spark': avatar08,
+  'procurement-check': avatar09,
+  'project-board': avatar10,
+  'data-insight': avatar01,
+  overall: avatar04,
 };
 
 type AvatarSource = Pick<EmployeeProfile, 'avatarKind' | 'avatarImage' | 'avatarPreset'>;
@@ -100,7 +97,7 @@ export function isUploadedAvatar(profile: AvatarSource): boolean {
 /** Resolve the image URL for an employee avatar (uploaded image or preset illustration). */
 export function employeeAvatarImage(profile: AvatarSource): string {
   if (isUploadedAvatar(profile)) return profile.avatarImage;
-  return PRESET_AVATAR_IMAGES[profile.avatarPreset || DEFAULT_AVATAR_PRESET] || avatarDefault;
+  return PRESET_AVATAR_IMAGES[profile.avatarPreset || DEFAULT_AVATAR_PRESET] || avatar01;
 }
 
 export const EMPLOYEE_TEMPLATES: EmployeeTemplate[] = [

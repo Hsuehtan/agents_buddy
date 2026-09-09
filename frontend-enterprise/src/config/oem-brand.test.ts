@@ -14,8 +14,8 @@ describe('OEM brand configuration', () => {
   beforeEach(() => {
     document.head.innerHTML = `
       <title>Initial title</title>
-      <link rel="icon" type="image/png" href="/favicon.png" />
-      <link rel="apple-touch-icon" href="/staffdeck-icon.png" />
+      <link rel="icon" type="image/x-icon" href="/favicon.ico?v=agentsbuddy-1" />
+      <link rel="apple-touch-icon" href="/AgentsBuddy.png?v=agentsbuddy-1" />
     `;
     delete document.documentElement.dataset.oemBrand;
   });
@@ -38,8 +38,10 @@ describe('OEM brand configuration', () => {
     expect(config.productName).toBe('Workspace');
     expect(config.productShortName).toBe('Workspace');
     expect(config.companyName).toBe('Example Company');
-    expect(config.copyright).toBe('© 2026 Example Company');
-    expect(config.documentTitle).toBe('Workspace 数字员工运营台');
+    expect(config.copyright)
+      .toBe(DEFAULT_OEM_BRAND.copyright.replace(DEFAULT_OEM_BRAND.companyName, 'Example Company'));
+    expect(config.documentTitle)
+      .toBe(DEFAULT_OEM_BRAND.documentTitle.replace(DEFAULT_OEM_BRAND.productName, 'Workspace'));
     expect(config.logoUrl).toBe('/oem/logo.svg');
     expect(config.faviconUrl).toBe('https://cdn.example.com/favicon.svg');
     expect(config.supportUrl).toBe('https://example.com/support');

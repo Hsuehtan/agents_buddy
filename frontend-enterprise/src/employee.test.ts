@@ -8,11 +8,11 @@ import {
 } from './employee';
 
 const EXPANDED_EMPLOYEES = [
-  ['sales-advisor', 'sales-handshake', '销售', '客户拓展顾问', 'staffdeck-avatar-sales.png'],
-  ['marketing-planner', 'marketing-spark', '市场', '市场内容策划', 'staffdeck-avatar-marketing.png'],
-  ['procurement-coordinator', 'procurement-check', '采购', '采购协同专员', 'staffdeck-avatar-procurement.png'],
-  ['project-manager', 'project-board', '项目管理', '项目推进经理', 'staffdeck-avatar-project.png'],
-  ['data-analyst', 'data-insight', '数据分析', '经营分析师', 'staffdeck-avatar-data.png'],
+  ['sales-advisor', 'sales-handshake', '销售', '客户拓展顾问', 'staffdeck-avatar-07.png'],
+  ['marketing-planner', 'marketing-spark', '市场', '市场内容策划', 'staffdeck-avatar-08.png'],
+  ['procurement-coordinator', 'procurement-check', '采购', '采购协同专员', 'staffdeck-avatar-09.png'],
+  ['project-manager', 'project-board', '项目管理', '项目推进经理', 'staffdeck-avatar-10.png'],
+  ['data-analyst', 'data-insight', '数据分析', '经营分析师', 'staffdeck-avatar-01.png'],
 ] as const;
 
 describe('expanded employee presets', () => {

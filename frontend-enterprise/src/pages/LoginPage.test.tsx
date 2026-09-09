@@ -8,6 +8,7 @@ import {
   ENTERPRISE_AUTH_STORAGE_KEY,
   type EnterpriseAuthSession,
 } from '../auth';
+import { DEFAULT_OEM_BRAND } from '../config/oem-brand';
 import { I18nProvider } from '../i18n';
 
 import LoginPage from './LoginPage';
@@ -62,7 +63,7 @@ describe('LoginPage', () => {
     renderLogin();
 
     expect(screen.getByText('我们来做什么？')).toBeTruthy();
-    expect(screen.getByAltText('StaffDeck 产品预览')).toBeTruthy();
+    expect(screen.getByAltText(`${DEFAULT_OEM_BRAND.productName} 产品预览`)).toBeTruthy();
     expect(screen.queryByLabelText('账号')).toBeNull();
 
     await user.click(screen.getByRole('button', { name: '登录' }));

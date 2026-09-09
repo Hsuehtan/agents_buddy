@@ -4,6 +4,8 @@ import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { DEFAULT_OEM_BRAND } from '@/config/oem-brand';
+
 import UpdateReminder, { REMINDED_VERSION_KEY } from './UpdateReminder';
 
 const mocks = vi.hoisted(() => ({
@@ -70,7 +72,7 @@ describe('UpdateReminder', () => {
 
     const renderToast = mocks.toastCustom.mock.calls[0][0];
     render(renderToast('toast-id'));
-    expect(screen.getByText('StaffDeck 有新版本')).toBeTruthy();
+    expect(screen.getByText(`${DEFAULT_OEM_BRAND.productName} 有新版本`)).toBeTruthy();
     expect(document.body.textContent).toContain(update.latest_version);
     expect(document.body.textContent).toContain(update.current_version);
     expect(screen.getByRole('link', { name: /查看更新/ }).getAttribute('href')).toBe(

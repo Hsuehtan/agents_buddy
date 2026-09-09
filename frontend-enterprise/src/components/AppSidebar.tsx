@@ -1,4 +1,5 @@
 import { useMemo } from 'react';
+import { ArrowLeft, ArrowRight } from 'lucide-react';
 import {
   Badge,
   DropdownMenu,
@@ -40,7 +41,6 @@ import IconClipboard from '../assets/icons/cap-clipboard.svg?react';
 import IconBriefcase from '../assets/icons/cap-briefcase.svg?react';
 import IconChat from '../assets/icons/action-chat.svg?react';
 import IconToggle from '../assets/icons/action-toggle.svg?react';
-import IconHeaderCollapse from '../assets/icons/header-collapse.svg?react';
 import IconAccounts from '../assets/icons/sys-accounts.svg?react';
 import IconModels from '../assets/icons/sys-models.svg?react';
 import IconSettings from '../assets/icons/action-toggle.svg?react';
@@ -529,7 +529,7 @@ function CollapsedSidebar({
               aria-label="展开边栏"
               className="flex size-[16px] items-center justify-center text-sidebar-foreground transition-colors hover:text-sidebar-accent-foreground"
             >
-              <IconHeaderCollapse className="size-[16px]! -rotate-90" />
+              <ArrowRight className="size-[16px]" strokeWidth={1.8} />
             </button>
           </TooltipTrigger>
           <TooltipContent side="right" align="center">
@@ -667,7 +667,7 @@ function ManagementSidebar({
               aria-label="收起边栏"
               className="flex size-[28px] shrink-0 items-center justify-center rounded-[8px] text-sidebar-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
             >
-              <IconHeaderCollapse className="size-[14px]! -rotate-90" />
+              <ArrowLeft className="size-[16px]" strokeWidth={1.8} />
             </button>
           )}
         </div>
@@ -1131,7 +1131,7 @@ function CollapsedChatSidebar({
               aria-label="展开边栏"
               className="flex size-[16px] items-center justify-center text-sidebar-foreground transition-colors hover:text-sidebar-accent-foreground"
             >
-              <IconHeaderCollapse className="size-[16px]! -rotate-90" />
+              <ArrowRight className="size-[16px]" strokeWidth={1.8} />
             </button>
           </TooltipTrigger>
           <TooltipContent side="right" align="center">
@@ -1331,7 +1331,7 @@ function ChatSidebarVariant({
               aria-label="收起边栏"
               className="flex size-[28px] shrink-0 items-center justify-center rounded-[8px] text-sidebar-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
             >
-              <IconHeaderCollapse className="size-[14px]! -rotate-90" />
+              <ArrowLeft className="size-[16px]" strokeWidth={1.8} />
             </button>
           </div>
 
