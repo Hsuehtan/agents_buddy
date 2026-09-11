@@ -8,7 +8,6 @@ import {
   ENTERPRISE_AUTH_STORAGE_KEY,
   type EnterpriseAuthSession,
 } from '../auth';
-import { DEFAULT_OEM_BRAND } from '../config/oem-brand';
 import { I18nProvider } from '../i18n';
 
 import LoginPage from './LoginPage';
@@ -46,7 +45,6 @@ async function showFormAndEnterCredentials(
   username = 'admin',
   password = 'secret',
 ) {
-  await user.click(screen.getByRole('button', { name: '登录' }));
   await user.type(screen.getByLabelText('账号'), username);
   await user.type(screen.getByLabelText('密码'), password);
 }
@@ -58,24 +56,17 @@ afterEach(() => {
 });
 
 describe('LoginPage', () => {
-  it('shows the original landing hero before revealing credentials', async () => {
-    const user = userEvent.setup();
+  it('shows the login form immediately without a product preview', () => {
     renderLogin();
-
-    expect(screen.getByText('我们来做什么？')).toBeTruthy();
-    expect(screen.getByAltText(`${DEFAULT_OEM_BRAND.productName} 产品预览`)).toBeTruthy();
-    expect(screen.queryByLabelText('账号')).toBeNull();
-
-    await user.click(screen.getByRole('button', { name: '登录' }));
 
     expect(screen.getByLabelText('账号')).toBeTruthy();
     expect(screen.getByLabelText('密码')).toBeTruthy();
+    expect(screen.queryByAltText(/产品预览/)).toBeNull();
   });
 
   it('toggles the password between hidden and visible text', async () => {
     const user = userEvent.setup();
     renderLogin();
-    await user.click(screen.getByRole('button', { name: '登录' }));
     const password = screen.getByLabelText('密码');
 
     expect(password.getAttribute('type')).toBe('password');

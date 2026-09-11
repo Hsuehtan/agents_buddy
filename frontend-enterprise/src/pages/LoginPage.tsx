@@ -7,21 +7,14 @@ import BrandLogo from '../components/BrandLogo';
 import IconFieldClear from '../assets/icons/field-clear.svg?react';
 import IconFieldEye from '../assets/icons/field-eye.svg?react';
 import IconFieldEyeOn from '../assets/icons/field-eye-on.svg?react';
-import loginPreview from '../assets/staffdeck/login-preview.png';
 import { OEM_BRAND } from '../config/oem-brand';
 
 export type LoginPageProps = {
   onLogin: (session: EnterpriseAuthSession) => void;
 };
 
-/**
- * Signed-out landing / login page. Mirrors Figma node 68:201 (`Login_light`):
- * a full-bleed hero with the configured wordmark and a product-preview placeholder
- * anchored to the bottom. Clicking "登录" slides the credentials form (node 68:1563)
- * down into view in place of the call-to-action button.
- */
+/** Signed-out login page with OEM branding and the existing authentication flow. */
 export default function LoginPage({ onLogin }: LoginPageProps) {
-  const [showForm, setShowForm] = useState(false);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -59,122 +52,129 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
   }
 
   const inputBaseClass =
-    'flex h-[44px] w-full items-center gap-[8px] rounded-[10px] border bg-white px-[16px] transition-colors';
+    'flex h-[46px] w-full items-center gap-[8px] rounded-[12px] border bg-white px-[14px] transition-colors focus-within:border-[#7da7ee] focus-within:ring-4 focus-within:ring-[#dce9ff]';
 
   return (
-    <div className="relative flex min-h-screen flex-col bg-white">
+    <div className="relative flex min-h-screen flex-col overflow-hidden bg-[#f4f7fc]">
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-x-0 top-0 h-[320px] bg-[radial-gradient(circle_at_50%_-20%,rgba(76,131,231,0.22),transparent_66%)]"
+      />
       <AppHeader
-        className="h-[60px] shrink-0 px-[32px]"
+        className="relative z-10 h-[72px] shrink-0 items-center px-[32px] max-[640px]:px-[20px]"
         left={<BrandLogo markSize={28} />}
         right={null}
       />
 
-      <main className="flex flex-1 flex-col items-center px-[32px]">
-        <div className="flex flex-col items-center pt-[60px]">
-          <span className="flex items-center justify-center rounded-[10px] border-[0.5px] border-[#e3e7f1] bg-[#f6f6f6] px-[20px] py-[6px] text-[14px] text-[#464c5e]">
-            我们来做什么？
-          </span>
-          <h1 className="mt-[6px] text-center text-[54px] font-semibold leading-[80px] tracking-[1.08px] text-[#18181a]">
-            {OEM_BRAND.productName}
-            <br />
-            {OEM_BRAND.descriptor}
-          </h1>
+      <main className="relative z-10 flex flex-1 items-center justify-center px-[24px] pb-[72px] pt-[32px] max-[640px]:px-[16px]">
+        <section
+          aria-labelledby="login-title"
+          className="w-full max-w-[420px] rounded-[24px] border border-[#e1e8f2] bg-white px-[40px] py-[38px] shadow-[0_24px_64px_rgba(38,65,112,0.13)] max-[480px]:rounded-[20px] max-[480px]:px-[24px]"
+        >
+          <div className="mb-[30px] text-center">
+            <span className="mx-auto grid size-[52px] place-items-center rounded-[16px] bg-[#edf4ff] ring-1 ring-[#d8e6fc]">
+              <BrandLogo markOnly markSize={34} />
+            </span>
+            <h1 id="login-title" className="mt-[18px] text-[26px] font-semibold tracking-[-0.3px] text-[#172033]">
+              登录 {OEM_BRAND.productName}
+            </h1>
+            <p className="mt-[8px] text-[13px] leading-[20px] text-[#7a869c]">
+              {OEM_BRAND.descriptor}
+            </p>
+          </div>
 
-          {!showForm ? (
-            <button
-              type="button"
-              onClick={() => setShowForm(true)}
-              className="mt-[24px] flex items-center justify-center rounded-[10px] bg-[#18181a] px-[36px] py-[10px] text-[16px] font-normal text-white transition-colors hover:bg-[#18181a]/90"
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              void login();
+            }}
+          >
+            <label htmlFor="login-username" className="mb-[8px] block text-[13px] font-medium text-[#3f4a5f]">
+              账号
+            </label>
+            <div
+              className={`${inputBaseClass} ${usernameError ? 'border-[#f54a45]' : username ? 'border-[#a9bbd5]' : 'border-[#dfe5ee]'}`}
             >
-              登录
-            </button>
-          ) : (
-            <form
-              className="mt-[24px] flex w-[320px] flex-col duration-300 ease-out animate-in fade-in slide-in-from-top-4"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void login();
-              }}
-            >
-              <div
-                className={`${inputBaseClass} ${usernameError ? 'border-[#f54a45]' : username ? 'border-[#18181a]' : 'border-[#e3e7f1]'}`}
-              >
-                <input
-                  value={username}
-                  autoComplete="username"
-                  placeholder="请输入账号（首次使用请输入admin）"
-                  aria-label="账号"
-                  onChange={(event) => {
-                    setUsername(event.target.value);
-                    if (usernameError) setUsernameError('');
-                  }}
-                  onKeyDown={onFieldKeyDown}
-                  className="min-w-0 flex-1 border-0 bg-transparent text-[14px] text-[#18181a] outline-none placeholder:text-[#757f9c]"
-                />
-                {username && (
-                  <button
-                    type="button"
-                    aria-label="清空账号"
-                    onClick={() => {
-                      setUsername('');
-                      setUsernameError('');
-                    }}
-                    className="grid size-[18px] shrink-0 place-items-center text-[#667085] outline-none transition-colors hover:text-[#464c5e]"
-                  >
-                    <IconFieldClear className="size-[18px]" />
-                  </button>
-                )}
-              </div>
-
-              <div
-                className={`mt-[24px] ${inputBaseClass} ${passwordError ? 'border-[#f54a45]' : password ? 'border-[#18181a]' : 'border-[#e3e7f1]'}`}
-              >
-                <input
-                  value={password}
-                  type={showPassword ? 'text' : 'password'}
-                  autoComplete="current-password"
-                  placeholder="请输入密码（首次使用请输入admin）"
-                  aria-label="密码"
-                  onChange={(event) => {
-                    setPassword(event.target.value);
-                    if (passwordError) setPasswordError('');
-                  }}
-                  onKeyDown={onFieldKeyDown}
-                  className="min-w-0 flex-1 border-0 bg-transparent text-[14px] text-[#18181a] outline-none placeholder:text-[#757f9c]"
-                />
+              <input
+                id="login-username"
+                value={username}
+                autoComplete="username"
+                autoFocus
+                placeholder="请输入账号（首次使用请输入admin）"
+                aria-label="账号"
+                aria-invalid={Boolean(usernameError)}
+                onChange={(event) => {
+                  setUsername(event.target.value);
+                  if (usernameError) setUsernameError('');
+                }}
+                onKeyDown={onFieldKeyDown}
+                className="min-w-0 flex-1 border-0 bg-transparent text-[14px] text-[#172033] outline-none placeholder:text-[#98a2b3]"
+              />
+              {username && (
                 <button
                   type="button"
-                  aria-label={showPassword ? '隐藏密码' : '显示密码'}
-                  onClick={() => setShowPassword((prev) => !prev)}
-                  className="grid size-[18px] shrink-0 place-items-center text-[#677185] outline-none transition-colors hover:text-[#464c5e]"
+                  aria-label="清空账号"
+                  onClick={() => {
+                    setUsername('');
+                    setUsernameError('');
+                  }}
+                  className="grid size-[18px] shrink-0 place-items-center text-[#7a869c] outline-none transition-colors hover:text-[#3f4a5f]"
                 >
-                  {showPassword ? (
-                    <IconFieldEyeOn className="size-[18px]" />
-                  ) : (
-                    <IconFieldEye className="size-[18px]" />
-                  )}
+                  <IconFieldClear className="size-[18px]" />
                 </button>
-              </div>
+              )}
+            </div>
+            <p className="mt-[6px] min-h-[18px] text-[12px] leading-[18px] text-[#d9363e]" aria-live="polite">
+              {usernameError}
+            </p>
 
+            <label htmlFor="login-password" className="mb-[8px] mt-[10px] block text-[13px] font-medium text-[#3f4a5f]">
+              密码
+            </label>
+            <div
+              className={`${inputBaseClass} ${passwordError ? 'border-[#f54a45]' : password ? 'border-[#a9bbd5]' : 'border-[#dfe5ee]'}`}
+            >
+              <input
+                id="login-password"
+                value={password}
+                type={showPassword ? 'text' : 'password'}
+                autoComplete="current-password"
+                placeholder="请输入密码（首次使用请输入admin）"
+                aria-label="密码"
+                aria-invalid={Boolean(passwordError)}
+                onChange={(event) => {
+                  setPassword(event.target.value);
+                  if (passwordError) setPasswordError('');
+                }}
+                onKeyDown={onFieldKeyDown}
+                className="min-w-0 flex-1 border-0 bg-transparent text-[14px] text-[#172033] outline-none placeholder:text-[#98a2b3]"
+              />
               <button
-                type="submit"
-                disabled={loading}
-                className="mt-[24px] flex h-[40px] w-[120px] items-center justify-center self-center rounded-[10px] bg-[#18181a] text-[16px] font-normal text-white transition-colors hover:bg-[#18181a]/90 disabled:cursor-not-allowed disabled:opacity-60"
+                type="button"
+                aria-label={showPassword ? '隐藏密码' : '显示密码'}
+                onClick={() => setShowPassword((prev) => !prev)}
+                className="grid size-[18px] shrink-0 place-items-center text-[#7a869c] outline-none transition-colors hover:text-[#3f4a5f]"
               >
-                {loading ? '登录中…' : '登录'}
+                {showPassword ? (
+                  <IconFieldEyeOn className="size-[18px]" />
+                ) : (
+                  <IconFieldEye className="size-[18px]" />
+                )}
               </button>
-            </form>
-          )}
-        </div>
+            </div>
+            <p className="mt-[6px] min-h-[18px] text-[12px] leading-[18px] text-[#d9363e]" aria-live="polite">
+              {passwordError}
+            </p>
 
-        <div className="mt-[32px] flex w-full justify-center">
-          <img
-            src={OEM_BRAND.loginArtworkUrl || loginPreview}
-            alt={`${OEM_BRAND.productShortName} 产品预览`}
-            className="h-auto w-full max-w-[1200px] select-none object-contain"
-            draggable={false}
-          />
-        </div>
+            <button
+              type="submit"
+              disabled={loading}
+              className="mt-[18px] flex h-[46px] w-full items-center justify-center rounded-[12px] bg-[#3167d7] text-[15px] font-medium text-white shadow-[0_8px_18px_rgba(49,103,215,0.24)] transition-colors hover:bg-[#285bc3] disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {loading ? '登录中…' : '登录'}
+            </button>
+          </form>
+        </section>
       </main>
     </div>
   );
